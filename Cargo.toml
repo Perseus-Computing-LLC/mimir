@@ -1,13 +1,13 @@
 [package]
-name = "engram-rs"
+name = "mneme"
 version = "0.1.0"
 edition = "2021"
-description = "Persistent memory engine for Perseus — MCP JSON-RPC stdio server"
-repository = "https://github.com/tcconnally/engram-rs"
+description = "Persistent memory engine for AI agents — MCP JSON-RPC stdio server"
+repository = "https://github.com/tcconnally/mneme"
 license = "MIT"
 
 [[bin]]
-name = "engram"
+name = "mneme"
 path = "src/main.rs"
 
 [dependencies]

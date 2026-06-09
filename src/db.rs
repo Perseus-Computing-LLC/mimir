@@ -55,7 +55,7 @@ impl Database {
                 workspace_hash TEXT DEFAULT '',
                 tags TEXT DEFAULT '{}',
                 links TEXT DEFAULT '[]',
-                source TEXT DEFAULT 'engram',
+                source TEXT DEFAULT 'mneme',
                 verified INTEGER DEFAULT 0
             );
 

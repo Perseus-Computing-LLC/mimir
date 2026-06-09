@@ -51,13 +51,13 @@ pub fn run_server(db: Database) {
     let reader = BufReader::new(stdin.lock());
     let mut state = MCPState::new();
 
-    eprintln!("engram-rs: MCP server ready");
+    eprintln!("mneme: MCP server ready");
 
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("engram-rs: stdin read error: {}", e);
+                eprintln!("mneme: stdin read error: {}", e);
                 break;
             }
         };
@@ -69,7 +69,7 @@ pub fn run_server(db: Database) {
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("engram-rs: JSON parse error: {} in line: {}", e, line);
+                eprintln!("mneme: JSON parse error: {} in line: {}", e, line);
                 // Try to send a parse error if we can extract an id
                 let error_response = json!({
                     "jsonrpc": "2.0",
@@ -114,7 +114,7 @@ fn handle_request(
                 result: Some(json!({
                     "protocolVersion": "2025-06-18",
                     "serverInfo": {
-                        "name": "engram-rs",
+                        "name": "mneme",
                         "version": "0.1.0"
                     },
                     "capabilities": {
@@ -144,7 +144,7 @@ fn handle_request(
                 result: Some(json!({
                     "tools": [
                         {
-                            "name": "engram_recall",
+                            "name": "mneme_recall",
                             "description": "Search memories with hybrid keyword+vector search",
                             "inputSchema": {
                                 "type": "object",
@@ -190,7 +190,7 @@ fn handle_request(
                             }
                         },
                         {
-                            "name": "engram_store",
+                            "name": "mneme_store",
                             "description": "Store a new memory",
                             "inputSchema": {
                                 "type": "object",
@@ -237,7 +237,7 @@ fn handle_request(
                             }
                         },
                         {
-                            "name": "engram_health",
+                            "name": "mneme_health",
                             "description": "Check server and database health",
                             "inputSchema": {
                                 "type": "object",
@@ -268,15 +268,15 @@ fn handle_request(
             let tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             let result_text = match tool_name {
-                "engram_recall" => match tools::handle_recall(db, tool_args) {
+                "mneme_recall" => match tools::handle_recall(db, tool_args) {
                     Ok(text) => text,
                     Err(e) => return Some(error_response(id, -32603, &e)),
                 },
-                "engram_store" => match tools::handle_store(db, tool_args) {
+                "mneme_store" => match tools::handle_store(db, tool_args) {
                     Ok(text) => text,
                     Err(e) => return Some(error_response(id, -32603, &e)),
                 },
-                "engram_health" => tools::handle_health(db),
+                "mneme_health" => tools::handle_health(db),
                 _ => return Some(error_response(id, -32601, &format!("Unknown tool: {}", tool_name))),
             };
 

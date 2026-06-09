@@ -5,9 +5,9 @@ mod tools;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "engram")]
+#[command(name = "mneme")]
 #[command(
-    about = "Persistent memory engine for Perseus — MCP JSON-RPC stdio server",
+    about = "Persistent memory engine for AI agents — MCP JSON-RPC stdio server",
     version = "0.1.0"
 )]
 struct Cli {
@@ -34,7 +34,7 @@ enum Commands {
 }
 
 fn default_db_path() -> String {
-    std::env::var("ENGRAM_DB_PATH").unwrap_or_else(|_| "engram.db".to_string())
+    std::env::var("MNEME_DB_PATH").unwrap_or_else(|_| "mneme.db".to_string())
 }
 
 fn main() {
@@ -44,9 +44,9 @@ fn main() {
     let db_path = match &cli.command {
         Some(Commands::Serve { db, .. }) => db.clone(),
         None => {
-            eprintln!("Usage: engram serve [--db PATH] [--mcp]");
+            eprintln!("Usage: mneme serve [--db PATH] [--mcp]");
             eprintln!("       The serve command starts the MCP JSON-RPC stdio server.");
-            eprintln!("       Set ENGRAM_DB_PATH env var to override default database path.");
+            eprintln!("       Set MNEME_DB_PATH env var to override default database path.");
             std::process::exit(0);
         }
     };
@@ -54,7 +54,7 @@ fn main() {
     let database = match db::Database::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("engram-rs: failed to open database at {}: {}", db_path, e);
+            eprintln!("mneme: failed to open database at {}: {}", db_path, e);
             std::process::exit(1);
         }
     };

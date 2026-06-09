@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Engram-rs One-Shot Bootstrap
-#  Persistent Memory Engine for Perseus — MCP JSON-RPC stdio server
+#  Mneme One-Shot Bootstrap
+#  Persistent memory engine for AI agents — MCP JSON-RPC stdio server
 #
 #  Usage:
-#    curl -sSL https://raw.githubusercontent.com/tcconnally/engram-rs/main/scripts/bootstrap.sh | bash
+#    curl -sSL https://raw.githubusercontent.com/tcconnally/mneme/main/scripts/bootstrap.sh | bash
 #
 #  What this does:
 #    1. Installs system dependencies (Rust toolchain via rustup, build tools)
-#    2. Clones and builds engram-rs from source (release binary)
-#    3. Installs the binary to ~/.local/bin/engram
+#    2. Clones and builds Mneme from source (release binary)
+#    3. Installs the binary to ~/.local/bin/mneme
 #    4. Creates the data directory and generates .env defaults
 #    5. Verifies the installation and prints a success summary
 #
@@ -33,18 +33,18 @@ info() { printf "${CYAN}→${NC} %s\n" "$*"; }
 header() { printf "\n${BOLD}══ %s ══${NC}\n" "$*"; }
 
 FORCE="${FORCE:-0}"
-ENGRAM_REPO="https://github.com/tcconnally/engram-rs.git"
-ENGRAM_DIR="${ENGRAM_DIR:-$HOME/.engram-rs}"
-ENGRAM_BIN_DIR="${ENGRAM_BIN_DIR:-$HOME/.local/bin}"
-ENGRAM_DATA_DIR="${ENGRAM_DATA_DIR:-$HOME/.perseus/engram}"
-ENGRAM_DB_PATH="${ENGRAM_DB_PATH:-$ENGRAM_DATA_DIR/engram.db}"
+MNEME_REPO="https://github.com/tcconnally/mneme.git"
+MNEME_DIR="${MNEME_DIR:-$HOME/.mneme}"
+MNEME_BIN_DIR="${MNEME_BIN_DIR:-$HOME/.local/bin}"
+MNEME_DATA_DIR="${MNEME_DATA_DIR:-$HOME/.mneme/data}"
+MNEME_DB_PATH="${MNEME_DB_PATH:-$MNEME_DATA_DIR/mneme.db}"
 WORKSPACE="${WORKSPACE:-$(pwd)}"
 
 echo ""
 echo "============================================"
-echo "  Engram-rs One-Shot Bootstrap"
-echo "  Persistent Memory Engine for Perseus"
-echo "  github.com/tcconnally/engram-rs"
+echo "  Mneme One-Shot Bootstrap"
+echo "  Persistent memory engine for AI agents"
+echo "  github.com/tcconnally/mneme"
 echo "============================================"
 
 # ── Step 1: System dependencies ─────────────────────────────────────────────
@@ -98,7 +98,7 @@ fi
 if command -v cc &>/dev/null; then
     ok "C compiler: $(cc --version 2>&1 | head -1)"
 else
-    fail "C compiler is required to build engram-rs (rusqlite with bundled SQLite). Install build-essential or equivalent."
+    fail "C compiler is required to build Mneme (rusqlite with bundled SQLite). Install build-essential or equivalent."
 fi
 
 # Check/install Rust
@@ -127,32 +127,32 @@ else
     fi
 fi
 
-# ── Step 2: Clone / update engram-rs repo ───────────────────────────────────
-header "Step 2: Clone & build engram-rs"
+# ── Step 2: Clone / update Mneme repo ───────────────────────────────────────
+header "Step 2: Clone & build Mneme"
 
-if [ -d "$ENGRAM_DIR/.git" ]; then
-    info "Updating existing checkout at $ENGRAM_DIR..."
-    git -C "$ENGRAM_DIR" fetch origin 2>/dev/null || true
-    LOCAL_HASH=$(git -C "$ENGRAM_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
-    REMOTE_HASH=$(git -C "$ENGRAM_DIR" rev-parse origin/main 2>/dev/null || echo "unknown")
+if [ -d "$MNEME_DIR/.git" ]; then
+    info "Updating existing checkout at $MNEME_DIR..."
+    git -C "$MNEME_DIR" fetch origin 2>/dev/null || true
+    LOCAL_HASH=$(git -C "$MNEME_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+    REMOTE_HASH=$(git -C "$MNEME_DIR" rev-parse origin/main 2>/dev/null || echo "unknown")
     if [ "$LOCAL_HASH" != "$REMOTE_HASH" ] || [ "$FORCE" = "1" ]; then
         info "Pulling latest changes..."
-        git -C "$ENGRAM_DIR" checkout main 2>/dev/null || git -C "$ENGRAM_DIR" checkout master 2>/dev/null || true
-        git -C "$ENGRAM_DIR" pull origin main 2>/dev/null || git -C "$ENGRAM_DIR" pull origin master 2>/dev/null || true
+        git -C "$MNEME_DIR" checkout main 2>/dev/null || git -C "$MNEME_DIR" checkout master 2>/dev/null || true
+        git -C "$MNEME_DIR" pull origin main 2>/dev/null || git -C "$MNEME_DIR" pull origin master 2>/dev/null || true
     else
         ok "Repo is up to date"
     fi
 else
-    info "Cloning engram-rs from GitHub..."
-    rm -rf "$ENGRAM_DIR"
-    git clone --depth 1 "$ENGRAM_REPO" "$ENGRAM_DIR"
+    info "Cloning Mneme from GitHub..."
+    rm -rf "$MNEME_DIR"
+    git clone --depth 1 "$MNEME_REPO" "$MNEME_DIR"
 fi
 
 # Build release binary
-info "Building engram-rs (release)..."
-cd "$ENGRAM_DIR"
+info "Building Mneme (release)..."
+cd "$MNEME_DIR"
 cargo build --release 2>&1 | tail -5
-BINARY="$ENGRAM_DIR/target/release/engram"
+BINARY="$MNEME_DIR/target/release/mneme"
 
 if [ ! -f "$BINARY" ]; then
     fail "Build failed. Check the output above for errors."
@@ -162,78 +162,78 @@ ok "Binary built: $BINARY ($(du -h "$BINARY" | cut -f1))"
 # ── Step 3: Install binary ──────────────────────────────────────────────────
 header "Step 3: Install binary"
 
-mkdir -p "$ENGRAM_BIN_DIR"
-cp "$BINARY" "$ENGRAM_BIN_DIR/engram"
-chmod +x "$ENGRAM_BIN_DIR/engram"
+mkdir -p "$MNEME_BIN_DIR"
+cp "$BINARY" "$MNEME_BIN_DIR/mneme"
+chmod +x "$MNEME_BIN_DIR/mneme"
 
 # Ensure ~/.local/bin is on PATH
 case ":$PATH:" in
-    *":$ENGRAM_BIN_DIR:"*) ;;
-    *) export PATH="$ENGRAM_BIN_DIR:$PATH" ;;
+    *":$MNEME_BIN_DIR:"*) ;;
+    *) export PATH="$MNEME_BIN_DIR:$PATH" ;;
 esac
 
-if command -v engram &>/dev/null; then
-    ENGRAM_VER=$(engram --version 2>&1 || echo "unknown")
-    ok "engram installed to $ENGRAM_BIN_DIR/engram"
-    ok "Version: $ENGRAM_VER"
+if command -v mneme &>/dev/null; then
+    MNEME_VER=$(mneme --version 2>&1 || echo "unknown")
+    ok "mneme installed to $MNEME_BIN_DIR/mneme"
+    ok "Version: $MNEME_VER"
 else
-    fail "engram not found on PATH after install. Check $ENGRAM_BIN_DIR"
+    fail "mneme not found on PATH after install. Check $MNEME_BIN_DIR"
 fi
 
 # ── Step 4: Create data directory ───────────────────────────────────────────
 header "Step 4: Data directory"
 
-if [ -d "$ENGRAM_DATA_DIR" ]; then
-    ok "Data directory exists: $ENGRAM_DATA_DIR"
+if [ -d "$MNEME_DATA_DIR" ]; then
+    ok "Data directory exists: $MNEME_DATA_DIR"
 else
-    info "Creating data directory: $ENGRAM_DATA_DIR"
-    mkdir -p "$ENGRAM_DATA_DIR"
+    info "Creating data directory: $MNEME_DATA_DIR"
+    mkdir -p "$MNEME_DATA_DIR"
     ok "Data directory created"
 fi
 
 # Warm up the database (creates tables + FTS5 index)
-if [ ! -f "$ENGRAM_DB_PATH" ]; then
-    info "Warming up database at $ENGRAM_DB_PATH..."
+if [ ! -f "$MNEME_DB_PATH" ]; then
+    info "Warming up database at $MNEME_DB_PATH..."
     # Brief serve+kill to trigger DB creation
-    timeout 2 engram serve --db "$ENGRAM_DB_PATH" --mcp 2>/dev/null || true
-    if [ -f "$ENGRAM_DB_PATH" ]; then
-        ok "Database created: $ENGRAM_DB_PATH"
+    timeout 2 mneme serve --db "$MNEME_DB_PATH" --mcp 2>/dev/null || true
+    if [ -f "$MNEME_DB_PATH" ]; then
+        ok "Database created: $MNEME_DB_PATH"
     else
         warn "Database warm-up didn't create the file (will be created on first serve)"
     fi
 else
-    ok "Database exists: $ENGRAM_DB_PATH"
+    ok "Database exists: $MNEME_DB_PATH"
 fi
 
 # ── Step 5: .env entries ────────────────────────────────────────────────────
 header "Step 5: Environment"
 
 ENV_FILE="$WORKSPACE/.env"
-ENGRAM_ENV_BLOCK="# ── Engram-rs ──────────────────────────────────────────────────────────
+MNEME_ENV_BLOCK="# ── Mneme ──────────────────────────────────────────────────────────────
 # Database path (default shown)
-ENGRAM_DB_PATH=$ENGRAM_DB_PATH
+MNEME_DB_PATH=$MNEME_DB_PATH
 "
 
 if [ -f "$ENV_FILE" ]; then
-    if grep -q "ENGRAM_DB_PATH" "$ENV_FILE" 2>/dev/null; then
-        ok "ENGRAM_DB_PATH already in .env"
+    if grep -q "MNEME_DB_PATH" "$ENV_FILE" 2>/dev/null; then
+        ok "MNEME_DB_PATH already in .env"
     else
-        info "Appending ENGRAM_DB_PATH to existing .env..."
-        echo "$ENGRAM_ENV_BLOCK" >> "$ENV_FILE"
+        info "Appending MNEME_DB_PATH to existing .env..."
+        echo "$MNEME_ENV_BLOCK" >> "$ENV_FILE"
         ok "Appended to $ENV_FILE"
     fi
 else
     BOOTSTRAP_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u)
     cat > "$ENV_FILE" << ENVEOF
 # =============================================================================
-#  Engram-rs Environment
-#  Generated by engram-rs bootstrap — ${BOOTSTRAP_DATE}
+#  Mneme Environment
+#  Generated by Mneme bootstrap — ${BOOTSTRAP_DATE}
 # =============================================================================
 
 # Database path
-ENGRAM_DB_PATH=$ENGRAM_DB_PATH
+MNEME_DB_PATH=$MNEME_DB_PATH
 
-# ── Optional: LLM Provider Keys (for future engram versions with LLM extraction) ──
+# ── Optional: LLM Provider Keys (for future versions with LLM extraction) ──
 # DEEPSEEK_API_KEY=***
 # OPENAI_API_KEY=***
 # ANTHROPIC_API_KEY=***
@@ -245,41 +245,38 @@ fi
 header "Step 6: Verify binary"
 
 # Quick smoke test: start server briefly, check it initializes
-SMOKE_OUT=$(timeout 2 engram serve --db "$ENGRAM_DB_PATH" --mcp 2>&1 </dev/null || true)
+SMOKE_OUT=$(timeout 2 mneme serve --db "$MNEME_DB_PATH" --mcp 2>&1 </dev/null || true)
 if echo "$SMOKE_OUT" | grep -q "MCP server ready"; then
     ok "MCP server initializes correctly"
-    ok "Tools: engram_recall, engram_store, engram_health"
+    ok "Tools: mneme_recall, mneme_store, mneme_health"
 else
     warn "MCP smoke test had issues (non-critical). Manual check:"
-    warn "  Run: engram serve --db $ENGRAM_DB_PATH --mcp"
+    warn "  Run: mneme serve --db $MNEME_DB_PATH --mcp"
 fi
 
 # ── Step 7: Success summary ─────────────────────────────────────────────────
 header "Success Summary"
 
 echo ""
-printf "  ${BOLD}%-30s${NC} %s\n" "Engram version:" "$(engram --version 2>&1 || echo 'unknown')"
-printf "  ${BOLD}%-30s${NC} %s\n" "Binary:" "$ENGRAM_BIN_DIR/engram"
-printf "  ${BOLD}%-30s${NC} %s\n" "Database:" "$([ -f "$ENGRAM_DB_PATH" ] && echo "✓ $ENGRAM_DB_PATH" || echo 'created on first serve')"
-printf "  ${BOLD}%-30s${NC} %s\n" "Data dir:" "$ENGRAM_DATA_DIR"
-printf "  ${BOLD}%-30s${NC} %s\n" "MCP tools:" "engram_recall, engram_store, engram_health"
+printf "  ${BOLD}%-30s${NC} %s\n" "Mneme version:" "$(mneme --version 2>&1 || echo 'unknown')"
+printf "  ${BOLD}%-30s${NC} %s\n" "Binary:" "$MNEME_BIN_DIR/mneme"
+printf "  ${BOLD}%-30s${NC} %s\n" "Database:" "$([ -f "$MNEME_DB_PATH" ] && echo "✓ $MNEME_DB_PATH" || echo 'created on first serve')"
+printf "  ${BOLD}%-30s${NC} %s\n" "Data dir:" "$MNEME_DATA_DIR"
+printf "  ${BOLD}%-30s${NC} %s\n" "MCP tools:" "mneme_recall, mneme_store, mneme_health"
 printf "  ${BOLD}%-30s${NC} %s\n" "Cargo:" "$(cargo --version 2>&1)"
 printf "  ${BOLD}%-30s${NC} %s\n" "OS:" "$(uname -s) $(uname -m)"
 printf "  ${BOLD}%-30s${NC} %s\n" ".env:" "$([ -f "$ENV_FILE" ] && echo '✓ exists' || echo '✗ missing')"
 
 echo ""
 echo "============================================"
-echo "  ${GREEN}Engram-rs bootstrap complete!${NC}"
+echo "  ${GREEN}Mneme bootstrap complete!${NC}"
 echo ""
 echo "  Quick commands:"
-echo "    engram serve --db $ENGRAM_DB_PATH --mcp   # Start MCP server"
-echo "    engram --version                          # Show version"
+echo "    mneme serve --db $MNEME_DB_PATH --mcp   # Start MCP server"
+echo "    mneme --version                         # Show version"
 echo ""
-echo "  To use with Perseus, add to .perseus/config.yaml:"
-echo "    engram:"
-echo "      enabled: true"
-echo "      transport: \"stdio\""
-echo "      command: [\"engram\", \"serve\", \"--db\", \"$ENGRAM_DB_PATH\", \"--mcp\"]"
+echo "  Standalone MCP server:"
+echo "    mneme serve --db $MNEME_DB_PATH --mcp"
 echo ""
-echo "  Docs: https://github.com/tcconnally/engram-rs"
+echo "  Docs: https://github.com/tcconnally/mneme"
 echo "============================================"

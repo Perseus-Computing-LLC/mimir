@@ -1,124 +1,156 @@
-# engram-rs
+# Mneme
 
-Persistent memory engine for AI coding assistants. Hybrid keyword search over
-SQLite + FTS5. MCP-native — drop-in memory for any MCP host. Works standalone:
-no API keys, no embeddings, no LLM required.
+> Persistent memory for AI agents. SQLite + FTS5. MCP-native. Fully local.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
 
+## What is Mneme?
+
+Mneme is a lightweight **MCP JSON-RPC 2.0 stdio server** that gives AI agents durable
+memory across sessions. Agents store facts they learn, and Mneme recalls them when
+needed — so the agent doesn't start from zero every time.
+
+It uses **SQLite with full-text search (FTS5)**. No API keys, no embeddings model, no
+LLM required. The binary makes zero network calls at runtime. You own the database.
+
+Works with any MCP host: Claude Desktop, Cursor, OpenClaw, Hermes Agent, etc.
+
 ---
 
-## ⚡ One-Shot Bootstrap
+## Quick Start
 
-A single command that installs Rust, builds engram-rs, creates the database, and
-verifies everything. **Paste this into any terminal — an AI assistant can run it
-with zero context:**
+### Option 1: One-shot bootstrap
+
+A single command that installs Rust (if needed), builds Mneme from source, and sets
+everything up:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/tcconnally/engram-rs/main/scripts/bootstrap.sh | bash
+curl -sSL https://raw.githubusercontent.com/tcconnally/mneme/main/scripts/bootstrap.sh | bash
 ```
 
-What it does:
-1. Installs system build tools (gcc, pkg-config) if missing
-2. Installs Rust via rustup if not present
-3. Clones and builds engram-rs from source (`cargo build --release`)
-4. Installs the binary to `~/.local/bin/engram`
-5. Creates the data directory `~/.perseus/engram/` and warms up the SQLite database
-6. Creates/amends `.env` with `ENGRAM_DB_PATH`
-7. Smoke-tests the MCP server
-8. Prints a success summary
+Idempotent — safe to re-run. Set `FORCE=1` to force a rebuild.
 
-**Idempotent** — safe to re-run. Set `FORCE=1` to force a rebuild.
+### Option 2: Build from source
+
+```bash
+git clone https://github.com/tcconnally/mneme.git
+cd mneme
+cargo build --release
+cp target/release/mneme ~/.local/bin/
+```
+
+**Requirements:** Rust 1.70+ (stable), a C compiler (rusqlite bundles SQLite).
 
 ---
 
-## What It Does
+## MCP Configuration
 
-Engram-rs is a lightweight **MCP JSON-RPC 2.0 stdio server** that provides
-durable memory for AI agents. It stores, searches, and retrieves memories
-using SQLite with full-text search (FTS5).
+Add Mneme as an MCP server in your host's config. Pick your tool:
 
-### MCP Tools
+### Claude Desktop
+
+`claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "mneme": {
+      "command": "mneme",
+      "args": ["serve", "--db", "/home/YOU/.mneme/data/mneme.db", "--mcp"]
+    }
+  }
+}
+```
+
+### Cursor
+
+`.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "mneme": {
+      "command": "mneme",
+      "args": ["serve", "--db", "/home/YOU/.mneme/data/mneme.db", "--mcp"]
+    }
+  }
+}
+```
+
+### OpenClaw
+
+In your OpenClaw MCP config:
+
+```json
+{
+  "mcpServers": {
+    "mneme": {
+      "command": "mneme",
+      "args": ["serve", "--db", "/home/YOU/.mneme/data/mneme.db", "--mcp"]
+    }
+  }
+}
+```
+
+### Hermes Agent
+
+`~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  mneme:
+    command: "mneme"
+    args: ["serve", "--db", "~/.mneme/data/mneme.db", "--mcp"]
+```
+
+---
+
+## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `engram_store` | Store a memory with content, type (`insight`/`architecture`/`decision`), tags, and importance |
-| `engram_recall` | Search memories by keyword query (FTS5 + LIKE fallback), filtered by type, workspace, topic |
-| `engram_health` | Check server and database health |
+| `mneme_store` | Store a memory with content, type (`insight`/`architecture`/`decision`), tags, and importance |
+| `mneme_recall` | Search memories by keyword query (FTS5 + LIKE fallback), filtered by type, workspace, topic |
+| `mneme_health` | Check server and database health |
 
 ### Key Properties
 
-- **Zero dependencies at runtime** — static binary with bundled SQLite, no network needed
+- **Zero runtime deps** — static binary with bundled SQLite, no network needed
 - **Keyword search** — FTS5 for BM25-ranked results, LIKE fallback for multi-word queries
 - **No LLM required** — stores and retrieves memories directly; no fact extraction, no embeddings
-- **MCP-native** — standard JSON-RPC 2.0 over stdio; works with any MCP host (Claude Desktop, Hermes Agent, etc.)
+- **MCP-native** — standard JSON-RPC 2.0 over stdio; works with any MCP host
 - **Single-file database** — one SQLite file with FTS5 index; easy to backup, copy, or inspect
 
 ---
 
 ## Usage
 
-### Standalone
+### Start the MCP server
 
 ```bash
-# Start the MCP server
-engram serve --db ~/.perseus/engram/engram.db --mcp
-
-# Show version
-engram --version
+mneme serve --db ~/.mneme/data/mneme.db --mcp
 ```
 
-### With Perseus
-
-Add to `.perseus/config.yaml`:
-
-```yaml
-engram:
-  enabled: true
-  transport: "stdio"
-  command: ["engram", "serve", "--db", "~/.perseus/engram/engram.db", "--mcp"]
-  timeout_s: 10.0
-  merge_strategy: "local_first"
-  fallback_to_local: true
-  circuit_breaker:
-    threshold: 3
-    cooldown: 120
-```
-
-Then add the `@memory` directive to `.perseus/context.md`:
-
-```markdown
-## Long-Term Memory (Engram-rs)
-
-@memory workspace_hash="auto" max_results=5 focus=recent
-```
-
-Perseus will automatically call `engram_recall` at render time and populate the
-`AGENTS.md` context with relevant memories.
-
-### Manual MCP Testing
+### Show version
 
 ```bash
-# Start the server
-engram serve --db /tmp/test.db --mcp
-
-# In another terminal, send JSON-RPC:
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | engram serve --db /tmp/test.db --mcp
+mneme --version
 ```
 
----
-
-## Building from Source
+### Override database path
 
 ```bash
-git clone https://github.com/tcconnally/engram-rs.git
-cd engram-rs
-cargo build --release
-# Binary at target/release/engram
+export MNEME_DB_PATH=/custom/path/mneme.db
+mneme serve --mcp
 ```
 
-**Requirements:** Rust 1.70+ (stable), a C compiler (rusqlite bundles SQLite).
+### Manual MCP testing
+
+```bash
+# Pipe JSON-RPC directly
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | mneme serve --db /tmp/test.db --mcp
+```
 
 ---
 
@@ -140,7 +172,7 @@ CREATE TABLE memories (
     workspace_hash TEXT DEFAULT '',
     tags TEXT DEFAULT '{}',
     links TEXT DEFAULT '[]',
-    source TEXT DEFAULT 'engram',
+    source TEXT DEFAULT 'mneme',
     verified INTEGER DEFAULT 0
 );
 
@@ -149,7 +181,14 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(content, content_rowid='rowid');
 
 ---
 
-## Version & Roadmap
+## Offline
+
+Mneme is fully offline after build. No telemetry, no API calls, no network requests —
+ever. The binary never dials home. You own every byte.
+
+---
+
+## Roadmap
 
 **Current:** v0.1.0 — MVP
 
@@ -163,6 +202,29 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(content, content_rowid='rowid');
 | Ebbinghaus decay algorithm | 🔜 v0.2 |
 | Cross-workspace federation | 🔜 v0.3 |
 | SSE transport | 🔜 v0.3 |
+
+---
+
+## Using Mneme with Perseus
+
+Mneme is also the default memory backend for [Perseus](https://github.com/tcconnally/perseus),
+a live context engine for AI agents. If you use Perseus, add to `.perseus/config.yaml`:
+
+```yaml
+mneme:
+  enabled: true
+  transport: "stdio"
+  command: ["mneme", "serve", "--db", "~/.mneme/data/mneme.db", "--mcp"]
+  timeout_s: 10.0
+  merge_strategy: "local_first"
+  fallback_to_local: true
+  circuit_breaker:
+    threshold: 3
+    cooldown: 120
+```
+
+Then add `@memory` to `.perseus/context.md` and Perseus will call `mneme_recall` at
+render time to populate context with relevant memories.
 
 ---
 

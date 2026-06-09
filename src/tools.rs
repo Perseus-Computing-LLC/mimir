@@ -125,7 +125,7 @@ pub fn handle_store(db: &Database, args: Value) -> Result<String, String> {
         links,
         workspace_hash: store_args.workspace_hash.unwrap_or_default(),
         tags,
-        source: "engram".to_string(),
+        source: "mneme".to_string(),
         verified: false,
     };
 
