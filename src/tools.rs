@@ -144,3 +144,10 @@ pub fn handle_health(db: &Database) -> String {
         json!({ "status": "unhealthy" }).to_string()
     }
 }
+
+pub fn handle_stats(db: &Database) -> String {
+    match db.stats() {
+        Ok(stats) => stats.to_string(),
+        Err(e) => json!({ "error": format!("Stats failed: {}", e) }).to_string(),
+    }
+}

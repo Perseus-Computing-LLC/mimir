@@ -249,6 +249,14 @@ fn handle_request(
                                 "type": "object",
                                 "properties": {}
                             }
+                        },
+                        {
+                            "name": "mimir_stats",
+                            "description": "Get database statistics (total memories, breakdowns by type/layer, timestamps)",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {}
+                            }
                         }
                     ]
                 })),
@@ -283,6 +291,7 @@ fn handle_request(
                     Err(e) => return Some(error_response(id, -32603, &e)),
                 },
                 "mimir_health" => tools::handle_health(db),
+                "mimir_stats" => tools::handle_stats(db),
                 _ => {
                     return Some(error_response(
                         id,

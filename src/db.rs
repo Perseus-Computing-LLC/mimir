@@ -69,8 +69,10 @@ impl Database {
     }
 
     pub fn health_check(&self) -> bool {
+        // Use a proper query (not execute_batch) to verify DB responsiveness.
+        // Succeeds on empty table — only fails on corruption or missing schema.
         self.conn
-            .execute_batch("SELECT 1 FROM memories LIMIT 1")
+            .query_row("SELECT 1", [], |_| Ok(()))
             .is_ok()
     }
 
@@ -292,6 +294,48 @@ impl Database {
         }
 
         Ok(items)
+    }
+
+    pub fn stats(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories", [], |r| r.get(0)
+        )?;
+        let by_type: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT type, COUNT(*) FROM memories GROUP BY type ORDER BY COUNT(*) DESC"
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            let mut v = Vec::new();
+            for row in rows { v.push(row?); }
+            v
+        };
+        let by_layer: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT layer, COUNT(*) FROM memories GROUP BY layer ORDER BY COUNT(*) DESC"
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            let mut v = Vec::new();
+            for row in rows { v.push(row?); }
+            v
+        };
+        let oldest_ms: Option<i64> = self.conn.query_row(
+            "SELECT MIN(created_at_unix_ms) FROM memories", [], |r| r.get(0)
+        ).ok();
+        let newest_ms: Option<i64> = self.conn.query_row(
+            "SELECT MAX(created_at_unix_ms) FROM memories", [], |r| r.get(0)
+        ).ok();
+
+        Ok(serde_json::json!({
+            "total_memories": total,
+            "by_type": by_type.into_iter().collect::<std::collections::HashMap<_, _>>(),
+            "by_layer": by_layer.into_iter().collect::<std::collections::HashMap<_, _>>(),
+            "oldest_unix_ms": oldest_ms,
+            "newest_unix_ms": newest_ms,
+        }))
     }
 }
 
