@@ -1,6 +1,6 @@
 # Mimir
 
-> Persistent memory for AI agents. SQLite + FTS5. MCP-native. Fully local.
+> Persistent memory for AI agents. Structured entity model. SQLite + FTS5. MCP-native. Fully local.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
@@ -8,22 +8,21 @@
 ## What is Mimir?
 
 Mimir is a lightweight **MCP JSON-RPC 2.0 stdio server** that gives AI agents durable
-memory across sessions. Agents store facts they learn, and Mimir recalls them when
-needed — so the agent doesn't start from zero every time.
+memory across sessions. Agents store structured entities, journal their decisions,
+and manage transient state — all through standard MCP tools.
 
-It uses **SQLite with full-text search (FTS5)**. No API keys, no embeddings model, no
-LLM required. The binary makes zero network calls at runtime. You own the database.
+It uses **SQLite with full-text search (FTS5)** across three tables: entities
+(structured, idempotent), journal (append-only event log), and state (key-value
+with TTL). No API keys, no embeddings model, no LLM required. The binary makes
+zero network calls at runtime. You own the database.
 
-Works with any MCP host: Claude Desktop, Cursor, OpenClaw, Hermes Agent, etc.
+Works with any MCP host: Claude Desktop, Cursor, OpenClaw, Hermes Agent, Perseus, etc.
 
 ---
 
 ## Quick Start
 
 ### Option 1: One-shot bootstrap
-
-A single command that installs Rust (if needed), builds Mimir from source, and sets
-everything up:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/tcconnally/mimir/main/scripts/bootstrap.sh | bash
@@ -46,41 +45,9 @@ cp target/release/mimir ~/.local/bin/
 
 ## MCP Configuration
 
-Add Mimir as an MCP server in your host's config. Pick your tool:
+Add Mimir as an MCP server in your host's config:
 
-### Claude Desktop
-
-`claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["--db", "/home/YOU/.mimir/data/mimir.db"]
-    }
-  }
-}
-```
-
-### Cursor
-
-`.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["--db", "/home/YOU/.mimir/data/mimir.db"]
-    }
-  }
-}
-```
-
-### OpenClaw
-
-In your OpenClaw MCP config:
+### Claude Desktop / Cursor / OpenClaw
 
 ```json
 {
@@ -95,8 +62,6 @@ In your OpenClaw MCP config:
 
 ### Hermes Agent
 
-`~/.hermes/config.yaml`:
-
 ```yaml
 mcp_servers:
   mimir:
@@ -104,83 +69,133 @@ mcp_servers:
     args: ["--db", "~/.mimir/data/mimir.db"]
 ```
 
+### Perseus
+
+```yaml
+mimir:
+  enabled: true
+  transport: "stdio"
+  command: ["mimir", "--db", "~/.mimir/data/mimir.db"]
+  timeout_s: 30.0
+  merge_strategy: "local_first"
+  fallback_to_local: true
+  circuit_breaker:
+    threshold: 3
+    cooldown: 120
+  context_categories: ["decision", "architecture", "convention"]
+  context_limit: 10
+```
+
 ---
 
-## MCP Tools
+## MCP Tools (v0.2.0)
+
+### Entity tools
 
 | Tool | Description |
-|------|-------------|
-| `mimir_store` | Store a memory with content, type (`insight`/`architecture`/`decision`), tags, and importance |
-| `mimir_recall` | Search memories by keyword query (FTS5 + LIKE fallback), filtered by type, workspace, topic |
-| `mimir_health` | Check server and database health |
+|---|---|
+| `mimir_remember` | Store or update an entity. Idempotent by (category, key). |
+| `mimir_recall` | Search entities with FTS5 + LIKE fallback, filtered by category/type/topic. |
+| `mimir_forget` | Soft-delete an entity (sets archived=1). Recoverable. |
+| `mimir_link` | Create a relationship link from one entity to another. |
+| `mimir_unlink` | Remove a link between entities. |
 
-### Key Properties
+### Journal tools
 
-- **Zero runtime deps** — static binary with bundled SQLite, no network needed
-- **Keyword search** — FTS5 for BM25-ranked results, LIKE fallback for multi-word queries
-- **No LLM required** — stores and retrieves memories directly; no fact extraction, no embeddings
-- **MCP-native** — standard JSON-RPC 2.0 over stdio; works with any MCP host
-- **Single-file database** — one SQLite file with FTS5 index; easy to backup, copy, or inspect
+| Tool | Description |
+|---|---|
+| `mimir_journal` | Append a journal event (decision/observation/action) with evaluated/acted/forward. |
+| `mimir_timeline` | Query journal events by time range with optional filters. |
 
----
+### State tools
 
-## Usage
+| Tool | Description |
+|---|---|
+| `mimir_state_set` | Set a key-value state entry with optional TTL (auto-expires). |
+| `mimir_state_get` | Get a state value. Returns null if expired or missing. |
+| `mimir_state_delete` | Delete a state entry. |
+| `mimir_state_list` | List state keys, optionally filtered by prefix. |
 
-### Start the MCP server
+### Management tools
 
-```bash
-mimir --db ~/.mimir/data/mimir.db
-```
-
-The legacy `mimir serve --db ... --mcp` form still works for older MCP host
-configs. The `--mcp` flag is deprecated because stdio MCP mode is always on.
-
-### Show version
-
-```bash
-mimir --version
-```
-
-### Override database path
-
-```bash
-export MIMIR_DB_PATH=/custom/path/mimir.db
-mimir
-```
-
-### Manual MCP testing
-
-```bash
-# Pipe JSON-RPC directly
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | mimir --db /tmp/test.db
-```
+| Tool | Description |
+|---|---|
+| `mimir_health` | Check server and database health. |
+| `mimir_stats` | Full database statistics across all three tables. |
+| `mimir_compact` | Archive entities below a decay threshold (supports dry-run). |
+| `mimir_migrate` | Migrate a v0.1.x database to v0.2.0 schema. |
+| `mimir_context` | Return pre-formatted markdown context block for session injection. |
+| `mimir_workspace_list` | List all distinct entity categories. |
 
 ---
 
 ## Database Schema
 
 ```sql
-CREATE TABLE memories (
-    id TEXT PRIMARY KEY,
-    content TEXT NOT NULL,
-    type TEXT NOT NULL DEFAULT 'insight',
-    summary TEXT DEFAULT '',
-    relevance REAL DEFAULT 0.0,
-    decay_score REAL DEFAULT 1.0,
-    retrieval_count INTEGER DEFAULT 0,
-    layer TEXT DEFAULT 'working',
-    topic_path TEXT DEFAULT '',
+-- Entities: structured, idempotent by UNIQUE(category, key)
+CREATE TABLE entities (
+    id TEXT PRIMARY KEY, category TEXT NOT NULL, key TEXT NOT NULL,
+    body_json TEXT NOT NULL DEFAULT '{}', status TEXT DEFAULT 'active',
+    type TEXT DEFAULT 'insight', tags TEXT DEFAULT '[]',
+    decay_score REAL DEFAULT 1.0, retrieval_count INTEGER DEFAULT 0,
+    layer TEXT DEFAULT 'working', topic_path TEXT DEFAULT '',
+    archived INTEGER DEFAULT 0, archive_reason TEXT DEFAULT '',
+    links TEXT DEFAULT '[]', verified INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'agent',
     created_at_unix_ms INTEGER NOT NULL,
     last_accessed_unix_ms INTEGER NOT NULL,
-    workspace_hash TEXT DEFAULT '',
-    tags TEXT DEFAULT '{}',
-    links TEXT DEFAULT '[]',
-    source TEXT DEFAULT 'mimir',
-    verified INTEGER DEFAULT 0
+    UNIQUE(category, key)
+);
+CREATE VIRTUAL TABLE entities_fts USING fts5(body_json, content_rowid='rowid');
+
+-- Journal: append-only event log with time-range access
+CREATE TABLE journal (
+    id TEXT PRIMARY KEY, event_type TEXT NOT NULL DEFAULT 'decision',
+    evaluated_json TEXT DEFAULT '{}', acted_json TEXT DEFAULT '{}',
+    forward_json TEXT DEFAULT '{}', category TEXT DEFAULT '',
+    key TEXT DEFAULT '', entity_id TEXT DEFAULT '',
+    created_at_unix_ms INTEGER NOT NULL
 );
 
-CREATE VIRTUAL TABLE memories_fts USING fts5(content, content_rowid='rowid');
+-- State: key-value with optional TTL
+CREATE TABLE state (
+    key TEXT PRIMARY KEY, value_json TEXT NOT NULL DEFAULT '{}',
+    expires_at_unix_ms INTEGER, created_at_unix_ms INTEGER NOT NULL
+);
 ```
+
+---
+
+## Entity Model
+
+The core concept in Mimir v0.2.0 is the **entity**: a structured fact with a
+composite key of `(category, key)`. This makes storage idempotent — call
+`mimir_remember` with the same category and key as many times as you want,
+and it updates the existing entity instead of creating a duplicate.
+
+Categories are user-defined. Common patterns:
+
+| Category | Example key | Body |
+|---|---|---|
+| `decision` | `use-postgres-16` | `{"decision": "Use PostgreSQL 16", "rationale": "..."}` |
+| `architecture` | `auth-module` | `{"component": "Auth", "stack": "JWT + SQLite"}` |
+| `convention` | `pr-review-required` | `{"rule": "All PRs require review before merge"}` |
+| `project` | `perseus` | `{"name": "Perseus", "repo": "tcconnally/perseus", "version": "1.0.7"}` |
+
+---
+
+## Key Properties
+
+- **Zero runtime deps** — static binary with bundled SQLite, no network needed
+- **Structured entity model** — idempotent upsert by (category, key)
+- **Category-filtered search** — narrow recall to specific categories
+- **Journal events** — append-only log with evaluated/acted/forward structure
+- **State with TTL** — key-value store with automatic expiration
+- **Entity linking** — create navigable relationships between entities
+- **FTS5 keyword search** — BM25-ranked results with LIKE fallback
+- **No LLM required** — stores and retrieves directly; no embeddings needed
+- **MCP-native** — standard JSON-RPC 2.0 over stdio
+- **Single-file database** — one SQLite file; easy to backup, copy, or inspect
 
 ---
 
@@ -193,41 +208,26 @@ ever. The binary never dials home. You own every byte.
 
 ## Roadmap
 
-**Current:** v0.1.1 — direct MCP server mode
+**Current:** v0.2.0 — structured entity model with journal + state
 
 | Feature | Status |
-|---------|--------|
+|---|---|
 | MCP JSON-RPC 2.0 stdio server | ✅ |
-| Keyword search (FTS5 + LIKE) | ✅ |
-| Memory store with metadata | ✅ |
-| SQLite persistence | ✅ |
-| Embedding-based vector search | 🔜 v0.2 |
-| Ebbinghaus decay algorithm | 🔜 v0.2 |
-| Cross-workspace federation | 🔜 v0.3 |
-| SSE transport | 🔜 v0.3 |
-
----
-
-## Using Mimir with Perseus
-
-Mimir is also the default memory backend for [Perseus](https://github.com/tcconnally/perseus),
-a live context engine for AI agents. If you use Perseus, add to `.perseus/config.yaml`:
-
-```yaml
-mimir:
-  enabled: true
-  transport: "stdio"
-  command: ["mimir", "--db", "~/.mimir/data/mimir.db"]
-  timeout_s: 10.0
-  merge_strategy: "local_first"
-  fallback_to_local: true
-  circuit_breaker:
-    threshold: 3
-    cooldown: 120
-```
-
-Then add `@memory` to `.perseus/context.md` and Perseus will call `mimir_recall` at
-render time to populate context with relevant memories.
+| FTS5 keyword search + LIKE fallback | ✅ |
+| Structured entity model (category/key) | ✅ v0.2.0 |
+| Category-filtered recall | ✅ v0.2.0 |
+| Journal events (evaluated/acted/forward) | ✅ v0.2.0 |
+| State with TTL (key-value + expiration) | ✅ v0.2.0 |
+| Entity linking (mimir_link / mimir_unlink) | ✅ v0.2.0 |
+| Soft-delete (mimir_forget) | ✅ v0.2.0 |
+| Context injection for session start | ✅ v0.2.0 |
+| Migration from v0.1.x | ✅ v0.2.0 |
+| Ebbinghaus decay algorithm | 🔜 v0.2.1 |
+| Layer promotion (buffer → working → core) | 🔜 v0.2.1 |
+| Embedding-based vector search | 🔜 v0.3 |
+| `.md` vault export/import | 🔜 v0.3 |
+| Cross-workspace federation | 🔜 v0.4 |
+| SSE transport | 🔜 v0.4 |
 
 ---
 

@@ -1,5 +1,7 @@
 mod db;
 mod mcp;
+mod models;
+mod schema;
 mod tools;
 
 use clap::{Parser, Subcommand};
@@ -35,6 +37,17 @@ enum Commands {
         #[arg(long = "mcp", default_value_t = false, hide = true)]
         _mcp: bool,
     },
+
+    /// Migrate a v0.1.x Mimir database to v0.2.0 schema
+    Migrate {
+        /// Path to the source v0.1.x database
+        #[arg(long)]
+        from: String,
+
+        /// Path to the target v0.2.0 database (creates if needed)
+        #[arg(long)]
+        to: String,
+    },
 }
 
 fn default_db_path() -> String {
@@ -44,21 +57,54 @@ fn default_db_path() -> String {
 fn main() {
     let cli = Cli::parse();
 
-    // Determine db path based on subcommand or top-level flag
-    let db_path = match &cli.command {
-        Some(Commands::Serve { db, .. }) => db.clone(),
-        None => cli.db.clone(),
-    };
+    match cli.command {
+        Some(Commands::Migrate { from, to }) => {
+            let target_db = match db::Database::open(&to) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("mimir: failed to open target database at {}: {}", to, e);
+                    std::process::exit(1);
+                }
+            };
 
-    let database = match db::Database::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("mimir: failed to open database at {}: {}", db_path, e);
-            std::process::exit(1);
+            match target_db.migrate_from_v0_1(&from) {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_else(|_| {
+                            format!("Migration complete (report serialization failed)")
+                        })
+                    );
+                }
+                Err(e) => {
+                    eprintln!("mimir: migration failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
-    };
-
-    mcp::run_server(database);
+        Some(Commands::Serve { ref db, .. }) => {
+            let db_path = db.clone();
+            let database = match db::Database::open(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("mimir: failed to open database at {}: {}", db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            mcp::run_server(database);
+        }
+        None => {
+            let db_path = cli.db.clone();
+            let database = match db::Database::open(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("mimir: failed to open database at {}: {}", db_path, e);
+                    std::process::exit(1);
+                }
+            };
+            mcp::run_server(database);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -74,18 +120,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_direct_server_with_deprecated_mcp_flag() {
-        let cli = Cli::parse_from(["mimir", "--db", "/tmp/mimir-direct.db", "--mcp"]);
-        assert!(cli.command.is_none());
-        assert_eq!(cli.db, "/tmp/mimir-direct.db");
-    }
-
-    #[test]
-    fn parses_serve_subcommand_with_deprecated_mcp_flag() {
-        let cli = Cli::parse_from(["mimir", "serve", "--db", "/tmp/mimir-serve.db", "--mcp"]);
+    fn parses_migrate_subcommand() {
+        let cli = Cli::parse_from([
+            "mimir",
+            "migrate",
+            "--from",
+            "/tmp/old.db",
+            "--to",
+            "/tmp/new.db",
+        ]);
         match cli.command {
-            Some(Commands::Serve { db, .. }) => assert_eq!(db, "/tmp/mimir-serve.db"),
-            None => panic!("expected serve subcommand"),
+            Some(Commands::Migrate { from, to }) => {
+                assert_eq!(from, "/tmp/old.db");
+                assert_eq!(to, "/tmp/new.db");
+            }
+            _ => panic!("expected migrate subcommand"),
         }
     }
 }

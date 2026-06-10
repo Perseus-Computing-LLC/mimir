@@ -1,225 +1,238 @@
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryLink {
-    pub target_id: String,
-    pub relationship: String,
-    pub weight: f64,
-}
+use crate::models::{
+    CompactReport, Entity, JournalEvent, MemoryLink, RecallParams, StateEntry, Stats,
+    TimelineParams,
+};
+use crate::schema;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryItem {
-    pub id: String,
-    pub content: String,
-    #[serde(rename = "type")]
-    pub memory_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    pub relevance: f64,
-    pub decay_score: f64,
-    pub retrieval_count: i64,
-    pub layer: String,
-    pub topic_path: String,
-    pub created_at_unix_ms: i64,
-    pub last_accessed_unix_ms: i64,
-    pub links: Vec<MemoryLink>,
-    pub workspace_hash: String,
-    pub tags: serde_json::Value,
-    pub source: String,
-    pub verified: bool,
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 pub struct Database {
     conn: Connection,
+    db_path: String,
 }
 
 impl Database {
+    /// Open a database at `path`, initializing the v0.2.0 schema if needed.
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let conn = Connection::open(path)?;
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                type TEXT NOT NULL DEFAULT 'insight',
-                summary TEXT DEFAULT '',
-                relevance REAL DEFAULT 0.0,
-                decay_score REAL DEFAULT 1.0,
-                retrieval_count INTEGER DEFAULT 0,
-                layer TEXT DEFAULT 'working',
-                topic_path TEXT DEFAULT '',
-                created_at_unix_ms INTEGER NOT NULL,
-                last_accessed_unix_ms INTEGER NOT NULL,
-                workspace_hash TEXT DEFAULT '',
-                tags TEXT DEFAULT '{}',
-                links TEXT DEFAULT '[]',
-                source TEXT DEFAULT 'mimir',
-                verified INTEGER DEFAULT 0
-            );
+        // Enable WAL for better concurrent read performance
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                content,
-                content_rowid='rowid'
-            );",
-        )?;
+        // Initialize schema if this is a new database
+        schema::initialize_schema(&conn)?;
 
-        Ok(Database { conn })
+        Ok(Database {
+            conn,
+            db_path: path.to_string(),
+        })
     }
 
+    /// Simple health check — verify the DB responds.
     pub fn health_check(&self) -> bool {
-        // Use a proper query (not execute_batch) to verify DB responsiveness.
-        // Succeeds on empty table — only fails on corruption or missing schema.
-        self.conn
-            .query_row("SELECT 1", [], |_| Ok(()))
-            .is_ok()
+        self.conn.query_row("SELECT 1", [], |_| Ok(())).is_ok()
     }
 
-    pub fn store(&self, item: &MemoryItem) -> Result<(), Box<dyn std::error::Error>> {
-        let tags_json = serde_json::to_string(&item.tags)?;
-        let links_json = serde_json::to_string(&item.links)?;
-        let summary = item.summary.as_deref().unwrap_or("");
+    // ─── Entities ────────────────────────────────────────────────
 
-        // Wrap in transaction so FTS index and main table stay consistent
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+    /// Store or update an entity. Idempotent by (category, key).
+    /// Returns the entity id and whether this was a create or update.
+    pub fn remember(&self, entity: &Entity) -> Result<(String, String), Box<dyn std::error::Error>> {
+        let tags_json = serde_json::to_string(&entity.tags)?;
+        let links_json = serde_json::to_string(&entity.links)?;
+        let archived_int = if entity.archived { 1 } else { 0 };
+        let verified_int = if entity.verified { 1 } else { 0 };
+
+        let existing_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM entities WHERE category = ?1 AND key = ?2",
+                params![entity.category, entity.key],
+                |r| r.get(0),
+            )
+            .ok();
+
+        let action;
+        let id;
+
+        if let Some(ex_id) = existing_id {
+            // Update existing entity
+            id = ex_id;
             self.conn.execute(
-                "INSERT INTO memories (id, content, type, summary, relevance, decay_score,
-                 retrieval_count, layer, topic_path, created_at_unix_ms, last_accessed_unix_ms,
-                 workspace_hash, tags, links, source, verified)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "UPDATE entities SET
+                    body_json = ?1, status = ?2, type = ?3, tags = ?4,
+                    decay_score = ?5, layer = ?6, topic_path = ?7,
+                    archived = ?8, archive_reason = ?9, links = ?10,
+                    verified = ?11, source = ?12, last_accessed_unix_ms = ?13
+                 WHERE id = ?14",
                 params![
-                    item.id,
-                    item.content,
-                    item.memory_type,
-                    summary,
-                    item.relevance,
-                    item.decay_score,
-                    item.retrieval_count,
-                    item.layer,
-                    item.topic_path,
-                    item.created_at_unix_ms,
-                    item.last_accessed_unix_ms,
-                    item.workspace_hash,
+                    entity.body_json,
+                    entity.status,
+                    entity.entity_type,
                     tags_json,
+                    entity.decay_score,
+                    entity.layer,
+                    entity.topic_path,
+                    archived_int,
+                    entity.archive_reason,
                     links_json,
-                    item.source,
-                    item.verified as i32,
+                    verified_int,
+                    entity.source,
+                    now_ms(),
+                    id,
                 ],
             )?;
 
-            // Also insert into FTS index
+            // Update FTS5 index
             self.conn.execute(
-                "INSERT INTO memories_fts (rowid, content) VALUES (last_insert_rowid(), ?1)",
-                params![item.content],
+                "UPDATE entities_fts SET body_json = ?1 WHERE rowid = (SELECT rowid FROM entities WHERE id = ?2)",
+                params![entity.body_json, id],
             )?;
 
-            Ok(())
-        })();
+            action = "updated".to_string();
+        } else {
+            // Insert new entity
+            id = entity.id.clone();
+            self.conn.execute(
+                "INSERT INTO entities
+                 (id, category, key, body_json, status, type, tags,
+                  decay_score, retrieval_count, layer, topic_path,
+                  archived, archive_reason, links, verified, source,
+                  created_at_unix_ms, last_accessed_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                         ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15, ?16,
+                         ?17, ?18)",
+                params![
+                    id,
+                    entity.category,
+                    entity.key,
+                    entity.body_json,
+                    entity.status,
+                    entity.entity_type,
+                    tags_json,
+                    entity.decay_score,
+                    entity.retrieval_count,
+                    entity.layer,
+                    entity.topic_path,
+                    archived_int,
+                    entity.archive_reason,
+                    links_json,
+                    verified_int,
+                    entity.source,
+                    entity.created_at_unix_ms,
+                    entity.last_accessed_unix_ms,
+                ],
+            )?;
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
+            // Add to FTS5 index
+            self.conn.execute(
+                "INSERT INTO entities_fts (rowid, body_json) VALUES (last_insert_rowid(), ?1)",
+                params![entity.body_json],
+            )?;
+
+            action = "created".to_string();
         }
+
+        Ok((id, action))
     }
 
-    // Mirrors MCP recall parameters; keep this flat until a request type exists.
-    #[allow(clippy::too_many_arguments)]
-    pub fn recall(
-        &self,
-        query: &str,
-        memory_types: &[String],
-        max_results: i64,
-        workspace_hash: &Option<String>,
-        _include_federation: bool,
-        _filters: &Option<serde_json::Value>,
-        min_decay_score: f64,
-        topic_path: &Option<String>,
-    ) -> Result<Vec<MemoryItem>, Box<dyn std::error::Error>> {
-        // Build conditions and parameters incrementally
+    /// Search entities with FTS5 + LIKE fallback and optional filters.
+    pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let mut conditions: Vec<String> = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        // Keyword search via FTS5 + LIKE fallback with OR semantics
-        if !query.is_empty() {
-            let words: Vec<&str> = query.split_whitespace().collect();
+        // Keyword search: FTS5 OR match + LIKE fallback
+        if !params.query.is_empty() {
+            let words: Vec<&str> = params
+                .query
+                .split_whitespace()
+                .filter(|w| !w.is_empty())
+                .collect();
 
-            // FTS5 query: join words with OR
-            let fts_query = words
-                .iter()
-                .map(|w| w.replace('\'', "''"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
+            if !words.is_empty() {
+                // FTS5 query: join words with OR
+                let fts_query = words
+                    .iter()
+                    .map(|w| w.replace('\'', "''"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                param_values.push(Box::new(fts_query));
 
-            // LIKE fallback: match any word as substring
-            let mut like_parts = Vec::new();
-            for _word in &words {
-                like_parts.push(format!(
-                    "content LIKE ?{}",
-                    param_values.len() + like_parts.len() + 2
+                // LIKE fallback: match each word as substring
+                let mut like_clauses = Vec::new();
+                for _ in &words {
+                    let idx = param_values.len() + 1;
+                    like_clauses.push(format!("body_json LIKE ?{}", idx));
+                }
+                for word in &words {
+                    param_values.push(Box::new(format!("%{}%", word.replace('\'', "''"))));
+                }
+
+                conditions.push(format!(
+                    "((rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?1)) OR {})",
+                    like_clauses.join(" OR ")
                 ));
             }
-            // Push FTS query first, then LIKE params
-            param_values.push(Box::new(fts_query));
-            for word in &words {
-                param_values.push(Box::new(format!("%{}%", word.replace('\'', "''"))));
-            }
-
-            let fts_placeholder = param_values.len() - words.len() - 1 + 1; // the position of fts_query
-            conditions.push(format!(
-                "((id IN (SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?{})) OR {})",
-                fts_placeholder,
-                like_parts.join(" OR ")
-            ));
         }
 
-        // Filter by memory types
-        if !memory_types.is_empty() {
-            let placeholders: Vec<String> = (0..memory_types.len())
-                .map(|i| format!("?{}", param_values.len() + i + 1))
-                .collect();
-            conditions.push(format!("type IN ({})", placeholders.join(",")));
-            for t in memory_types {
+        // Filter by category
+        if let Some(ref cat) = params.category {
+            if !cat.is_empty() {
+                conditions.push(format!("category = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(cat.clone()));
+            }
+        }
+
+        // Filter by type
+        if let Some(ref t) = params.entity_type {
+            if !t.is_empty() {
+                conditions.push(format!("type = ?{}", param_values.len() + 1));
                 param_values.push(Box::new(t.clone()));
             }
         }
 
-        // Filter by workspace hash
-        if let Some(ref wh) = workspace_hash {
-            if !wh.is_empty() {
-                conditions.push(format!("workspace_hash = ?{}", param_values.len() + 1));
-                param_values.push(Box::new(wh.clone()));
-            }
-        }
-
         // Filter by decay score
-        if min_decay_score > 0.0 {
-            conditions.push(format!("decay_score >= ?{}", param_values.len() + 1));
-            param_values.push(Box::new(min_decay_score));
+        if params.min_decay > 0.0 {
+            conditions.push(format!(
+                "decay_score >= ?{}",
+                param_values.len() + 1
+            ));
+            param_values.push(Box::new(params.min_decay));
         }
 
-        // Filter by topic path (prefix match, escape LIKE wildcards)
-        if let Some(ref tp) = topic_path {
+        // Filter by topic path prefix
+        if let Some(ref tp) = params.topic_path {
             if !tp.is_empty() {
-                conditions.push(format!("topic_path LIKE ?{}", param_values.len() + 1));
+                conditions.push(format!(
+                    "topic_path LIKE ?{}",
+                    param_values.len() + 1
+                ));
                 let escaped = tp.replace('%', "\\%").replace('_', "\\_");
                 param_values.push(Box::new(format!("{}%", escaped)));
             }
         }
 
-        // Build final SQL
+        // Exclude archived unless explicitly requested
+        if !params.include_archived {
+            conditions.push("archived = 0".to_string());
+        }
+
+        // Build query
         let mut sql = String::from(
-            "SELECT id, content, type, summary, relevance, decay_score,
-             retrieval_count, layer, topic_path, created_at_unix_ms,
-             last_accessed_unix_ms, links, workspace_hash, tags, source, verified
-             FROM memories",
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms
+             FROM entities",
         );
 
         if !conditions.is_empty() {
@@ -227,51 +240,315 @@ impl Database {
             sql.push_str(&conditions.join(" AND "));
         }
 
+        // Rank by retrieval count + recency
         sql.push_str(" ORDER BY retrieval_count DESC, last_accessed_unix_ms DESC");
 
         sql.push_str(&format!(" LIMIT ?{}", param_values.len() + 1));
-        param_values.push(Box::new(max_results));
+        param_values.push(Box::new(params.limit));
 
-        // Build param refs
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            let links_str: String = row
-                .get::<_, String>(11)
-                .unwrap_or_else(|_| "[]".to_string());
-            let tags_str: String = row
-                .get::<_, String>(13)
-                .unwrap_or_else(|_| "{}".to_string());
-            let links: Vec<MemoryLink> = serde_json::from_str(&links_str).unwrap_or_default();
-            let tags: serde_json::Value = serde_json::from_str(&tags_str)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            let tags_str: String =
+                row.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string());
+            let links_str: String =
+                row.get::<_, String>(13).unwrap_or_else(|_| "[]".to_string());
 
-            Ok(MemoryItem {
+            let tags: Vec<String> =
+                serde_json::from_str(&tags_str).unwrap_or_default();
+            let links: Vec<MemoryLink> =
+                serde_json::from_str(&links_str).unwrap_or_default();
+            let archived: i32 = row.get(11).unwrap_or(0);
+            let verified: i32 = row.get(14).unwrap_or(0);
+
+            Ok(Entity {
                 id: row.get(0)?,
-                content: row.get(1)?,
-                memory_type: row.get(2)?,
-                summary: {
-                    let s: String = row.get::<_, String>(3).unwrap_or_default();
-                    if s.is_empty() {
-                        None
-                    } else {
-                        Some(s)
-                    }
-                },
-                relevance: row.get(4)?,
-                decay_score: row.get(5)?,
-                retrieval_count: row.get(6)?,
-                layer: row.get(7)?,
-                topic_path: row.get(8)?,
-                created_at_unix_ms: row.get(9)?,
-                last_accessed_unix_ms: row.get(10)?,
-                links,
-                workspace_hash: row.get(12)?,
+                category: row.get(1)?,
+                key: row.get(2)?,
+                body_json: row.get(3)?,
+                status: row.get(4)?,
+                entity_type: row.get(5)?,
                 tags,
-                source: row.get(14)?,
-                verified: row.get::<_, i32>(15)? != 0,
+                decay_score: row.get(7)?,
+                retrieval_count: row.get(8)?,
+                layer: row.get(9)?,
+                topic_path: row.get(10)?,
+                archived: archived != 0,
+                archive_reason: row.get(12)?,
+                links,
+                verified: verified != 0,
+                source: row.get(15)?,
+                created_at_unix_ms: row.get(16)?,
+                last_accessed_unix_ms: row.get(17)?,
+            })
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            let entity = row?;
+            // Update retrieval count and recency
+            let _ = self.conn.execute(
+                "UPDATE entities SET retrieval_count = retrieval_count + 1,
+                 last_accessed_unix_ms = ?1 WHERE id = ?2",
+                params![now_ms(), entity.id],
+            );
+            items.push(entity);
+        }
+
+        Ok(items)
+    }
+
+    /// Get a single entity by category and key.
+    pub fn get_entity(
+        &self,
+        category: &str,
+        key: &str,
+    ) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        // Find the entity by category + key
+        let mut stmt = self.conn.prepare(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms
+             FROM entities WHERE category = ?1 AND key = ?2 LIMIT 1",
+        )?;
+
+        let mut rows = stmt.query_map(params![category, key], |row| {
+            let tags_str: String =
+                row.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string());
+            let links_str: String =
+                row.get::<_, String>(13).unwrap_or_else(|_| "[]".to_string());
+            let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+            let links: Vec<MemoryLink> =
+                serde_json::from_str(&links_str).unwrap_or_default();
+            let archived: i32 = row.get(11).unwrap_or(0);
+            let verified: i32 = row.get(14).unwrap_or(0);
+
+            Ok(Entity {
+                id: row.get(0)?,
+                category: row.get(1)?,
+                key: row.get(2)?,
+                body_json: row.get(3)?,
+                status: row.get(4)?,
+                entity_type: row.get(5)?,
+                tags,
+                decay_score: row.get(7)?,
+                retrieval_count: row.get(8)?,
+                layer: row.get(9)?,
+                topic_path: row.get(10)?,
+                archived: archived != 0,
+                archive_reason: row.get(12)?,
+                links,
+                verified: verified != 0,
+                source: row.get(15)?,
+                created_at_unix_ms: row.get(16)?,
+                last_accessed_unix_ms: row.get(17)?,
+            })
+        })?;
+
+        if let Some(row) = rows.next() {
+            Ok(Some(row?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Soft-delete an entity (set archived = 1).
+    pub fn forget(
+        &self,
+        category: &str,
+        key: &str,
+        reason: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let affected = self.conn.execute(
+            "UPDATE entities SET archived = 1, archive_reason = ?1,
+             last_accessed_unix_ms = ?2
+             WHERE category = ?3 AND key = ?4 AND archived = 0",
+            params![reason, now_ms(), category, key],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Create a link from one entity to another.
+    pub fn link(
+        &self,
+        from_category: &str,
+        from_key: &str,
+        to_id: &str,
+        relationship: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Verify both entities exist
+        let from = self.get_entity(from_category, from_key)?
+            .ok_or("Source entity not found")?;
+        let _to: String = self.conn.query_row(
+            "SELECT id FROM entities WHERE id = ?1",
+            params![to_id],
+            |r| r.get(0),
+        ).map_err(|_| "Target entity not found")?;
+
+        // Check for duplicate link
+        let existing: Option<String> = self.conn.query_row(
+            "SELECT links FROM entities WHERE id = ?1",
+            params![from.id],
+            |r| r.get(0),
+        ).ok();
+        if let Some(links_str) = existing {
+            let mut links: Vec<MemoryLink> =
+                serde_json::from_str(&links_str).unwrap_or_default();
+            // Avoid duplicates
+            if !links.iter().any(|l| l.target_id == to_id) {
+                links.push(MemoryLink {
+                    target_id: to_id.to_string(),
+                    relationship: relationship.to_string(),
+                    weight: 0.5,
+                });
+            }
+            let new_links = serde_json::to_string(&links)?;
+            self.conn.execute(
+                "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+                params![new_links, now_ms(), from.id],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove a link from one entity to another.
+    pub fn unlink(
+        &self,
+        from_category: &str,
+        from_key: &str,
+        to_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let from = self.get_entity(from_category, from_key)?
+            .ok_or("Source entity not found")?;
+
+        let links_str: String = self.conn.query_row(
+            "SELECT links FROM entities WHERE id = ?1",
+            params![from.id],
+            |r| r.get(0),
+        )?;
+
+        let mut links: Vec<MemoryLink> =
+            serde_json::from_str(&links_str).unwrap_or_default();
+        let before = links.len();
+        links.retain(|l| l.target_id != to_id);
+
+        if links.len() == before {
+            return Ok(()); // Link wasn't there, nothing to do
+        }
+
+        let new_links = serde_json::to_string(&links)?;
+        self.conn.execute(
+            "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+            params![new_links, now_ms(), from.id],
+        )?;
+
+        Ok(())
+    }
+
+    // ─── Journal ─────────────────────────────────────────────────
+
+    /// Append a journal event.
+    pub fn journal(&self, event: &JournalEvent) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute(
+            "INSERT INTO journal
+             (id, event_type, evaluated_json, acted_json, forward_json,
+              category, key, entity_id, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event.id,
+                event.event_type,
+                event.evaluated_json,
+                event.acted_json,
+                event.forward_json,
+                event.category,
+                event.key,
+                event.entity_id,
+                event.created_at_unix_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Query journal events with time-range and filter parameters.
+    pub fn timeline(
+        &self,
+        params: &TimelineParams,
+    ) -> Result<Vec<JournalEvent>, Box<dyn std::error::Error>> {
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(from) = params.from_ms {
+            conditions.push(format!(
+                "created_at_unix_ms >= ?{}",
+                param_values.len() + 1
+            ));
+            param_values.push(Box::new(from));
+        }
+
+        if let Some(to) = params.to_ms {
+            conditions.push(format!(
+                "created_at_unix_ms <= ?{}",
+                param_values.len() + 1
+            ));
+            param_values.push(Box::new(to));
+        }
+
+        if let Some(ref et) = params.event_type {
+            if !et.is_empty() {
+                conditions.push(format!("event_type = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(et.clone()));
+            }
+        }
+
+        if let Some(ref cat) = params.category {
+            if !cat.is_empty() {
+                conditions.push(format!("category = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(cat.clone()));
+            }
+        }
+
+        if let Some(ref eid) = params.entity_id {
+            if !eid.is_empty() {
+                conditions.push(format!("entity_id = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(eid.clone()));
+            }
+        }
+
+        let mut sql = String::from(
+            "SELECT id, event_type, evaluated_json, acted_json, forward_json,
+                    category, key, entity_id, created_at_unix_ms
+             FROM journal",
+        );
+
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        sql.push_str(" ORDER BY created_at_unix_ms DESC");
+
+        sql.push_str(&format!(" LIMIT ?{}", param_values.len() + 1));
+        param_values.push(Box::new(params.limit));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(JournalEvent {
+                id: row.get(0)?,
+                event_type: row.get(1)?,
+                evaluated_json: row.get(2)?,
+                acted_json: row.get(3)?,
+                forward_json: row.get(4)?,
+                category: row.get(5)?,
+                key: row.get(6)?,
+                entity_id: row.get(7)?,
+                created_at_unix_ms: row.get(8)?,
             })
         })?;
 
@@ -279,69 +556,461 @@ impl Database {
         for row in rows {
             items.push(row?);
         }
-
-        // Update retrieval counts for found items
-        for item in &items {
-            let _ = self.conn.execute(
-                "UPDATE memories SET retrieval_count = retrieval_count + 1, last_accessed_unix_ms = ?1 WHERE id = ?2",
-                params![now_ms(), item.id],
-            );
-            let new_relevance = (item.relevance + 0.05).min(1.0);
-            let _ = self.conn.execute(
-                "UPDATE memories SET relevance = ?1 WHERE id = ?2",
-                params![new_relevance, item.id],
-            );
-        }
-
         Ok(items)
     }
 
-    pub fn stats(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let total: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memories", [], |r| r.get(0)
-        )?;
-        let by_type: Vec<(String, i64)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT type, COUNT(*) FROM memories GROUP BY type ORDER BY COUNT(*) DESC"
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            let mut v = Vec::new();
-            for row in rows { v.push(row?); }
-            v
-        };
-        let by_layer: Vec<(String, i64)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT layer, COUNT(*) FROM memories GROUP BY layer ORDER BY COUNT(*) DESC"
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            let mut v = Vec::new();
-            for row in rows { v.push(row?); }
-            v
-        };
-        let oldest_ms: Option<i64> = self.conn.query_row(
-            "SELECT MIN(created_at_unix_ms) FROM memories", [], |r| r.get(0)
-        ).ok();
-        let newest_ms: Option<i64> = self.conn.query_row(
-            "SELECT MAX(created_at_unix_ms) FROM memories", [], |r| r.get(0)
-        ).ok();
+    // ─── State ───────────────────────────────────────────────────
 
-        Ok(serde_json::json!({
-            "total_memories": total,
-            "by_type": by_type.into_iter().collect::<std::collections::HashMap<_, _>>(),
-            "by_layer": by_layer.into_iter().collect::<std::collections::HashMap<_, _>>(),
-            "oldest_unix_ms": oldest_ms,
-            "newest_unix_ms": newest_ms,
-        }))
+    /// Set a state key-value pair with optional TTL.
+    pub fn state_set(&self, entry: &StateEntry) -> Result<(), Box<dyn std::error::Error>> {
+        // Clean expired entries first (opportunistic)
+        let _ = self.conn.execute(
+            "DELETE FROM state WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms < ?1",
+            params![now_ms()],
+        );
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO state (key, value_json, expires_at_unix_ms, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                entry.key,
+                entry.value_json,
+                entry.expires_at_unix_ms,
+                entry.created_at_unix_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a state value. Returns None if the key doesn't exist or has expired.
+    pub fn state_get(
+        &self,
+        key: &str,
+    ) -> Result<Option<StateEntry>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value_json, expires_at_unix_ms, created_at_unix_ms
+             FROM state WHERE key = ?1",
+        )?;
+
+        let mut rows = stmt.query_map(params![key], |row| {
+            Ok(StateEntry {
+                key: row.get(0)?,
+                value_json: row.get(1)?,
+                expires_at_unix_ms: row.get(2)?,
+                created_at_unix_ms: row.get(3)?,
+            })
+        })?;
+
+        if let Some(row) = rows.next() {
+            let entry = row?;
+            // Check expiration
+            if let Some(expires) = entry.expires_at_unix_ms {
+                if expires < now_ms() {
+                    // Expired — delete and return None
+                    let _ = self
+                        .conn
+                        .execute("DELETE FROM state WHERE key = ?1", params![key]);
+                    return Ok(None);
+                }
+            }
+            Ok(Some(entry))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a state entry.
+    pub fn state_delete(&self, key: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM state WHERE key = ?1", params![key])?;
+        Ok(affected > 0)
+    }
+
+    /// List state keys matching an optional prefix.
+    pub fn state_list(&self, prefix: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        // Delete expired entries first
+        let _ = self.conn.execute(
+            "DELETE FROM state WHERE expires_at_unix_ms IS NOT NULL AND expires_at_unix_ms < ?1",
+            params![now_ms()],
+        );
+
+        let keys: Vec<String> = if prefix.is_empty() {
+            let mut stmt = self.conn.prepare("SELECT key FROM state ORDER BY key")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row?);
+            }
+            v
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT key FROM state WHERE key LIKE ?1 ORDER BY key",
+            )?;
+            let pattern = format!("{}%", prefix);
+            let rows = stmt.query_map(params![pattern], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row?);
+            }
+            v
+        };
+
+        Ok(keys)
+    }
+
+    // ─── Management ──────────────────────────────────────────────
+
+    /// Database statistics.
+    pub fn stats(&self) -> Result<Stats, Box<dyn std::error::Error>> {
+        schema::gather_stats(&self.conn, &self.db_path)
+    }
+
+    /// Migrate from v0.1.x database.
+    pub fn migrate_from_v0_1(
+        &self,
+        old_path: &str,
+    ) -> Result<crate::models::MigrationReport, Box<dyn std::error::Error>> {
+        schema::migrate_from_v0_1(old_path, &self.conn)
+    }
+
+    /// Compact: archive entities below a decay threshold.
+    pub fn compact(
+        &self,
+        min_decay: f64,
+        dry_run: bool,
+    ) -> Result<CompactReport, Box<dyn std::error::Error>> {
+        let examined: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM entities WHERE archived = 0", [], |r| {
+                r.get(0)
+            })?;
+
+        let archived = if dry_run {
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM entities WHERE archived = 0 AND decay_score < ?1",
+                params![min_decay],
+                |r| r.get(0),
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE entities SET archived = 1, archive_reason = 'decay threshold',
+                 last_accessed_unix_ms = ?1
+                 WHERE archived = 0 AND decay_score < ?2",
+                params![now_ms(), min_decay],
+            )? as i64
+        };
+
+        Ok(CompactReport {
+            entities_archived: archived,
+            entities_examined: examined,
+            dry_run,
+            completed_at_unix_ms: now_ms(),
+        })
+    }
+
+    /// Return a pre-formatted context block of top entities for session injection.
+    pub fn context(
+        &self,
+        categories: &[String],
+        limit: i64,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut all_entities = Vec::new();
+
+        if categories.is_empty() {
+            // No filter — get top entities overall
+            let params = RecallParams {
+                limit,
+                ..RecallParams::default()
+            };
+            all_entities = self.recall(&params)?;
+        } else {
+            for cat in categories {
+                let params = RecallParams {
+                    category: Some(cat.clone()),
+                    limit,
+                    ..RecallParams::default()
+                };
+                let mut batch = self.recall(&params)?;
+                all_entities.append(&mut batch);
+            }
+        }
+
+        // Format as markdown
+        let mut ctx = String::from("## Mimir Context\n\n");
+        for entity in &all_entities {
+            ctx.push_str(&format!(
+                "- [{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
+                entity.category,
+                entity.key,
+                truncate_str(&entity.body_json, 100),
+                entity.retrieval_count,
+                entity.decay_score,
+            ));
+        }
+        ctx.push_str(&format!("\n> {} entities recalled\n", all_entities.len()));
+
+        Ok(ctx)
+    }
+
+    /// List all distinct categories in the entities table.
+    pub fn workspace_list_categories(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT category FROM entities WHERE archived = 0 ORDER BY category")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut cats = Vec::new();
+        for row in rows {
+            cats.push(row?);
+        }
+        Ok(cats)
     }
 }
 
-pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_db() -> (Database, String) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mimir-test-db-{}.db", uuid::Uuid::new_v4()));
+        let path_str = path.to_str().unwrap().to_string();
+        let db = Database::open(&path_str).expect("open test db");
+        (db, path_str)
+    }
+
+    fn make_entity(id: &str, category: &str, key: &str, body: &str) -> Entity {
+        Entity {
+            id: id.to_string(),
+            category: category.to_string(),
+            key: key.to_string(),
+            body_json: body.to_string(),
+            status: "active".to_string(),
+            entity_type: "insight".to_string(),
+            tags: vec![],
+            decay_score: 1.0,
+            retrieval_count: 0,
+            layer: "working".to_string(),
+            topic_path: String::new(),
+            archived: false,
+            archive_reason: String::new(),
+            links: vec![],
+            verified: false,
+            source: "test".to_string(),
+            created_at_unix_ms: now_ms(),
+            last_accessed_unix_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn health_check_on_new_db() {
+        let (db, path) = temp_db();
+        assert!(db.health_check());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_creates_and_updates_entity() {
+        let (db, path) = temp_db();
+
+        let entity = make_entity(
+            "mem-test-1",
+            "decision",
+            "use-postgres",
+            r#"{"decision": "Use PostgreSQL"}"#,
+        );
+        let (id, action) = db.remember(&entity).unwrap();
+        assert_eq!(action, "created");
+        assert_eq!(id, "mem-test-1");
+
+        // Verify retrieval
+        let found = db.get_entity("decision", "use-postgres").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().body_json, r#"{"decision": "Use PostgreSQL"}"#);
+
+        // Update the same entity (idempotent)
+        let mut updated = entity.clone();
+        updated.body_json = r#"{"decision": "Use PostgreSQL 16"}"#.to_string();
+        let (id2, action2) = db.remember(&updated).unwrap();
+        assert_eq!(action2, "updated");
+        assert_eq!(id2, "mem-test-1");
+
+        let found2 = db.get_entity("decision", "use-postgres").unwrap();
+        assert_eq!(
+            found2.unwrap().body_json,
+            r#"{"decision": "Use PostgreSQL 16"}"#
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_with_category_filter() {
+        let (db, path) = temp_db();
+
+        let e1 = make_entity("e1", "decision", "use-pg", r#"{"d": "pg"}"#);
+        let e2 = make_entity("e2", "architecture", "app-stack", r#"{"a": "stack"}"#);
+        db.remember(&e1).unwrap();
+        db.remember(&e2).unwrap();
+
+        // Recall with category filter
+        let params = RecallParams {
+            category: Some("decision".to_string()),
+            limit: 10,
+            ..RecallParams::default()
+        };
+        let results = db.recall(&params).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].category, "decision");
+
+        // Recall without filter
+        let params2 = RecallParams::default();
+        let results2 = db.recall(&params2).unwrap();
+        assert_eq!(results2.len(), 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_and_archive() {
+        let (db, path) = temp_db();
+
+        let e = make_entity("e-f", "decision", "forget-me", "{}");
+        db.remember(&e).unwrap();
+
+        let ok = db.forget("decision", "forget-me", "no longer relevant").unwrap();
+        assert!(ok);
+
+        // Archived entity not in default recall
+        let params = RecallParams::default();
+        let results = db.recall(&params).unwrap();
+        assert!(results.is_empty());
+
+        // But retrievable with include_archived
+        let params2 = RecallParams {
+            include_archived: true,
+            ..RecallParams::default()
+        };
+        let results2 = db.recall(&params2).unwrap();
+        assert_eq!(results2.len(), 1);
+        assert!(results2[0].archived);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn link_and_unlink() {
+        let (db, path) = temp_db();
+
+        let e1 = make_entity("e1", "decision", "use-pg", "{}");
+        let e2 = make_entity("e2", "architecture", "db-layer", "{}");
+        db.remember(&e1).unwrap();
+        db.remember(&e2).unwrap();
+
+        db.link("decision", "use-pg", "e2", "depends_on").unwrap();
+
+        let entity = db.get_entity("decision", "use-pg").unwrap().unwrap();
+        assert_eq!(entity.links.len(), 1);
+        assert_eq!(entity.links[0].target_id, "e2");
+
+        // Unlink
+        db.unlink("decision", "use-pg", "e2").unwrap();
+        let entity2 = db.get_entity("decision", "use-pg").unwrap().unwrap();
+        assert_eq!(entity2.links.len(), 0);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn journal_and_timeline() {
+        let (db, path) = temp_db();
+
+        let event = JournalEvent {
+            id: "jrn-1".to_string(),
+            event_type: "decision".to_string(),
+            evaluated_json: r#"{"options": ["pg", "mysql"]}"#.to_string(),
+            acted_json: r#"{"chosen": "pg"}"#.to_string(),
+            forward_json: r#"{"next": "migrate"}"#.to_string(),
+            category: "decision".to_string(),
+            key: "use-pg".to_string(),
+            entity_id: "e1".to_string(),
+            created_at_unix_ms: now_ms(),
+        };
+        db.journal(&event).unwrap();
+
+        let timeline = TimelineParams::default();
+        let events = db.timeline(&timeline).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "decision");
+        assert!(events[0].acted_json.contains("pg"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn state_set_get_expire() {
+        let (db, path) = temp_db();
+
+        let entry = StateEntry {
+            key: "test-key".to_string(),
+            value_json: r#"{"value": 42}"#.to_string(),
+            expires_at_unix_ms: None,
+            created_at_unix_ms: now_ms(),
+        };
+        db.state_set(&entry).unwrap();
+
+        let got = db.state_get("test-key").unwrap();
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().value_json, r#"{"value": 42}"#);
+
+        // Set with TTL in the past
+        let expired = StateEntry {
+            key: "expired-key".to_string(),
+            value_json: r#"{"value": 1}"#.to_string(),
+            expires_at_unix_ms: Some(now_ms() - 1000),
+            created_at_unix_ms: now_ms(),
+        };
+        db.state_set(&expired).unwrap();
+
+        let got2 = db.state_get("expired-key").unwrap();
+        assert!(got2.is_none()); // Should be auto-deleted
+
+        // Delete
+        assert!(db.state_delete("test-key").unwrap());
+        assert!(db.state_get("test-key").unwrap().is_none());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compact_archives_below_threshold() {
+        let (db, path) = temp_db();
+
+        let mut e1 = make_entity("e-a", "test", "keep", "{}");
+        e1.decay_score = 0.9;
+        let mut e2 = make_entity("e-b", "test", "archive", "{}");
+        e2.decay_score = 0.1;
+        db.remember(&e1).unwrap();
+        db.remember(&e2).unwrap();
+
+        let report = db.compact(0.3, false).unwrap();
+        assert_eq!(report.entities_examined, 2);
+        assert_eq!(report.entities_archived, 1);
+
+        let params = RecallParams::default();
+        let results = db.recall(&params).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "keep");
+
+        let _ = fs::remove_file(&path);
+    }
 }

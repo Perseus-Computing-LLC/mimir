@@ -1,58 +1,35 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
-use crate::db::{now_ms, Database, MemoryItem, MemoryLink};
+use crate::db::{now_ms, Database};
+use crate::models::{Entity, JournalEvent, RecallParams, StateEntry, TimelineParams};
 
-#[derive(Debug, Deserialize)]
-pub struct RecallArgs {
-    pub query: String,
-    #[serde(default)]
-    pub memory_types: Vec<String>,
-    #[serde(default = "default_max_results")]
-    pub max_results: i64,
-    #[serde(default)]
-    pub workspace_hash: Option<String>,
-    #[serde(default)]
-    pub include_federation: bool,
-    #[serde(default)]
-    pub filters: Option<Value>,
-    #[serde(default)]
-    pub min_decay_score: f64,
-    #[serde(default)]
-    pub topic_path: Option<String>,
-}
-
-fn default_max_results() -> i64 {
-    10
-}
+// ─── Deserialization structs ────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-pub struct StoreArgs {
-    pub content: String,
-    #[serde(default = "default_memory_type")]
-    pub memory_type: String,
+pub struct RememberArgs {
+    pub category: String,
+    pub key: String,
+    pub body_json: String,
+    #[serde(default = "default_status")]
+    pub status: String,
+    #[serde(default = "default_entity_type")]
+    #[serde(rename = "type")]
+    pub entity_type: String,
     #[serde(default)]
-    pub workspace_hash: Option<String>,
-    #[serde(default)]
-    pub tags: Option<Value>,
-    #[serde(default)]
-    pub links: Option<Vec<LinkArg>>,
+    pub tags: Vec<String>,
     #[serde(default = "default_importance")]
     pub importance: f64,
     #[serde(default)]
-    pub topic_path: Option<String>,
+    pub topic_path: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct LinkArg {
-    pub target_id: String,
-    #[serde(default)]
-    pub relationship: String,
-    #[serde(default = "default_weight")]
-    pub weight: f64,
+fn default_status() -> String {
+    "active".to_string()
 }
 
-fn default_memory_type() -> String {
+fn default_entity_type() -> String {
     "insight".to_string()
 }
 
@@ -60,80 +37,410 @@ fn default_importance() -> f64 {
     0.5
 }
 
-fn default_weight() -> f64 {
-    0.5
+#[derive(Debug, Deserialize)]
+pub struct RecallArgs {
+    pub query: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(rename = "type")]
+    #[serde(default)]
+    pub entity_type: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub min_decay: f64,
+    #[serde(default)]
+    pub topic_path: Option<String>,
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
-pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
-    let recall_args: RecallArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
+fn default_limit() -> i64 {
+    10
+}
 
-    let items = db
-        .recall(
-            &recall_args.query,
-            &recall_args.memory_types,
-            recall_args.max_results,
-            &recall_args.workspace_hash,
-            recall_args.include_federation,
-            &recall_args.filters,
-            recall_args.min_decay_score,
-            &recall_args.topic_path,
-        )
-        .map_err(|e| format!("Recall failed: {}", e))?;
+#[derive(Debug, Deserialize)]
+pub struct ForgetArgs {
+    pub category: String,
+    pub key: String,
+    #[serde(default)]
+    pub reason: String,
+}
 
-    let result = json!({ "items": items });
+#[derive(Debug, Deserialize)]
+pub struct LinkArgs {
+    pub from_category: String,
+    pub from_key: String,
+    pub to_id: String,
+    #[serde(default)]
+    pub relationship: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnlinkArgs {
+    pub from_category: String,
+    pub from_key: String,
+    pub to_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JournalArgs {
+    #[serde(default = "default_event_type")]
+    pub event_type: String,
+    #[serde(default)]
+    pub evaluated: Value,
+    #[serde(default)]
+    pub acted: Value,
+    #[serde(default)]
+    pub forward: Value,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub entity_id: String,
+}
+
+fn default_event_type() -> String {
+    "decision".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TimelineArgs {
+    #[serde(default)]
+    pub from_ms: Option<i64>,
+    #[serde(default)]
+    pub to_ms: Option<i64>,
+    #[serde(default)]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub entity_id: Option<String>,
+    #[serde(default = "default_timeline_limit")]
+    pub limit: i64,
+}
+
+fn default_timeline_limit() -> i64 {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateSetArgs {
+    pub key: String,
+    pub value_json: String,
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateGetArgs {
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateDeleteArgs {
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StateListArgs {
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompactArgs {
+    #[serde(default = "default_min_decay")]
+    pub min_decay: f64,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_min_decay() -> f64 {
+    0.1
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MigrateArgs {
+    pub from_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContextArgs {
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default = "default_context_limit")]
+    pub limit: i64,
+}
+
+fn default_context_limit() -> i64 {
+    10
+}
+
+// ─── Tool handlers ──────────────────────────────────────────────
+
+pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
+    let a: RememberArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid remember arguments: {}", e))?;
+
+    let raw_id = Uuid::new_v4().to_string().replace('-', "");
+    let id = format!("mem-{}", &raw_id[..12]);
+    let now = now_ms();
+
+    let entity = Entity {
+        id,
+        category: a.category,
+        key: a.key,
+        body_json: a.body_json,
+        status: a.status,
+        entity_type: a.entity_type,
+        tags: a.tags,
+        decay_score: a.importance,
+        retrieval_count: 0,
+        layer: "working".to_string(),
+        topic_path: a.topic_path,
+        archived: false,
+        archive_reason: String::new(),
+        links: vec![],
+        verified: false,
+        source: "agent".to_string(),
+        created_at_unix_ms: now,
+        last_accessed_unix_ms: now,
+    };
+
+    let (eid, action) = db
+        .remember(&entity)
+        .map_err(|e| format!("Remember failed: {}", e))?;
+
+    let result = json!({
+        "id": eid,
+        "action": action,
+        "category": entity.category,
+        "key": entity.key,
+    });
     Ok(result.to_string())
 }
 
-pub fn handle_store(db: &Database, args: Value) -> Result<String, String> {
-    let store_args: StoreArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid store arguments: {}", e))?;
+pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
+    let a: RecallArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
 
-    let raw_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let id = format!("mem-{}", &raw_id[..12]);
-
-    let tags = store_args.tags.unwrap_or(json!({}));
-    let links: Vec<MemoryLink> = store_args
-        .links
-        .unwrap_or_default()
-        .into_iter()
-        .map(|l| MemoryLink {
-            target_id: l.target_id,
-            relationship: l.relationship,
-            weight: l.weight,
-        })
-        .collect();
-
-    let summary = if store_args.content.chars().count() > 80 {
-        Some(store_args.content.chars().take(80).collect::<String>())
-    } else {
-        Some(store_args.content.clone())
+    let params = RecallParams {
+        query: a.query,
+        category: a.category,
+        entity_type: a.entity_type,
+        limit: a.limit,
+        min_decay: a.min_decay,
+        topic_path: a.topic_path,
+        include_archived: a.include_archived,
     };
+
+    let entities = db
+        .recall(&params)
+        .map_err(|e| format!("Recall failed: {}", e))?;
+
+    let result = json!({
+        "items": entities,
+        "total": entities.len(),
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_forget(db: &Database, args: Value) -> Result<String, String> {
+    let a: ForgetArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid forget arguments: {}", e))?;
+
+    let reason = if a.reason.is_empty() {
+        "manual".to_string()
+    } else {
+        a.reason
+    };
+
+    let found = db
+        .forget(&a.category, &a.key, &reason)
+        .map_err(|e| format!("Forget failed: {}", e))?;
+
+    let result = json!({
+        "found": found,
+        "category": a.category,
+        "key": a.key,
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_link(db: &Database, args: Value) -> Result<String, String> {
+    let a: LinkArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid link arguments: {}", e))?;
+
+    let rel = if a.relationship.is_empty() {
+        "related".to_string()
+    } else {
+        a.relationship
+    };
+
+    db.link(&a.from_category, &a.from_key, &a.to_id, &rel)
+        .map_err(|e| format!("Link failed: {}", e))?;
+
+    let result = json!({
+        "success": true,
+        "from": format!("{}/{}", a.from_category, a.from_key),
+        "to": a.to_id,
+        "relationship": rel,
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_unlink(db: &Database, args: Value) -> Result<String, String> {
+    let a: UnlinkArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid unlink arguments: {}", e))?;
+
+    db.unlink(&a.from_category, &a.from_key, &a.to_id)
+        .map_err(|e| format!("Unlink failed: {}", e))?;
+
+    let result = json!({
+        "success": true,
+        "from": format!("{}/{}", a.from_category, a.from_key),
+        "to": a.to_id,
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_journal(db: &Database, args: Value) -> Result<String, String> {
+    let a: JournalArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid journal arguments: {}", e))?;
+
+    let raw_id = Uuid::new_v4().to_string().replace('-', "");
+    let id = format!("jrn-{}", &raw_id[..12]);
+
+    let event = JournalEvent {
+        id,
+        event_type: a.event_type,
+        evaluated_json: a.evaluated.to_string(),
+        acted_json: a.acted.to_string(),
+        forward_json: a.forward.to_string(),
+        category: a.category,
+        key: a.key,
+        entity_id: a.entity_id,
+        created_at_unix_ms: now_ms(),
+    };
+
+    db.journal(&event)
+        .map_err(|e| format!("Journal failed: {}", e))?;
+
+    let result = json!({
+        "id": event.id,
+        "event_type": event.event_type,
+        "created_at_unix_ms": event.created_at_unix_ms,
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_timeline(db: &Database, args: Value) -> Result<String, String> {
+    let a: TimelineArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid timeline arguments: {}", e))?;
+
+    let params = TimelineParams {
+        from_ms: a.from_ms,
+        to_ms: a.to_ms,
+        event_type: a.event_type,
+        category: a.category,
+        entity_id: a.entity_id,
+        limit: a.limit,
+    };
+
+    let events = db
+        .timeline(&params)
+        .map_err(|e| format!("Timeline failed: {}", e))?;
+
+    let result = json!({
+        "items": events,
+        "total": events.len(),
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_state_set(db: &Database, args: Value) -> Result<String, String> {
+    let a: StateSetArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid state_set arguments: {}", e))?;
 
     let now = now_ms();
-    let item = MemoryItem {
-        id: id.clone(),
-        content: store_args.content,
-        memory_type: store_args.memory_type,
-        summary,
-        relevance: store_args.importance,
-        decay_score: 1.0,
-        retrieval_count: 0,
-        layer: "working".to_string(),
-        topic_path: store_args.topic_path.unwrap_or_default(),
+    let expires_at = a.ttl_seconds.map(|ttl| now + (ttl * 1000));
+
+    let entry = StateEntry {
+        key: a.key.clone(),
+        value_json: a.value_json,
+        expires_at_unix_ms: expires_at,
         created_at_unix_ms: now,
-        last_accessed_unix_ms: now,
-        links,
-        workspace_hash: store_args.workspace_hash.unwrap_or_default(),
-        tags,
-        source: "mimir".to_string(),
-        verified: false,
     };
 
-    db.store(&item)
-        .map_err(|e| format!("Store failed: {}", e))?;
+    db.state_set(&entry)
+        .map_err(|e| format!("State set failed: {}", e))?;
 
-    let result = json!({ "success": true, "id": id });
+    let result = json!({
+        "key": a.key,
+        "ttl_seconds": a.ttl_seconds,
+        "expires_at_unix_ms": expires_at,
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_state_get(db: &Database, args: Value) -> Result<String, String> {
+    let a: StateGetArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid state_get arguments: {}", e))?;
+
+    let entry = db
+        .state_get(&a.key)
+        .map_err(|e| format!("State get failed: {}", e))?;
+
+    match entry {
+        Some(e) => {
+            let result = json!({
+                "found": true,
+                "key": e.key,
+                "value": e.value_json,
+                "expires_at_unix_ms": e.expires_at_unix_ms,
+                "created_at_unix_ms": e.created_at_unix_ms,
+            });
+            Ok(result.to_string())
+        }
+        None => {
+            let result = json!({
+                "found": false,
+                "key": a.key,
+            });
+            Ok(result.to_string())
+        }
+    }
+}
+
+pub fn handle_state_delete(db: &Database, args: Value) -> Result<String, String> {
+    let a: StateDeleteArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid state_delete arguments: {}", e))?;
+
+    let found = db
+        .state_delete(&a.key)
+        .map_err(|e| format!("State delete failed: {}", e))?;
+
+    let result = json!({
+        "found": found,
+        "key": a.key,
+    });
+    Ok(result.to_string())
+}
+
+pub fn handle_state_list(db: &Database, args: Value) -> Result<String, String> {
+    let a: StateListArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid state_list arguments: {}", e))?;
+
+    let keys = db
+        .state_list(&a.prefix)
+        .map_err(|e| format!("State list failed: {}", e))?;
+
+    let result = json!({
+        "keys": keys,
+        "total": keys.len(),
+    });
     Ok(result.to_string())
 }
 
@@ -147,7 +454,58 @@ pub fn handle_health(db: &Database) -> String {
 
 pub fn handle_stats(db: &Database) -> String {
     match db.stats() {
-        Ok(stats) => stats.to_string(),
-        Err(e) => json!({ "error": format!("Stats failed: {}", e) }).to_string(),
+        Ok(stats) => serde_json::to_string(&stats).unwrap_or_else(|e| {
+            json!({ "error": format!("Stats serialization failed: {}", e) }).to_string()
+        }),
+        Err(e) => json!({"error": format!("Stats failed: {}", e)}).to_string(),
+    }
+}
+
+pub fn handle_compact(db: &Database, args: Value) -> String {
+    let a: CompactArgs = serde_json::from_value(args).unwrap_or(CompactArgs {
+        min_decay: 0.1,
+        dry_run: false,
+    });
+
+    match db.compact(a.min_decay, a.dry_run) {
+        Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
+            json!({"error": format!("Compact report serialization failed: {}", e)}).to_string()
+        }),
+        Err(e) => json!({"error": format!("Compact failed: {}", e)}).to_string(),
+    }
+}
+
+pub fn handle_migrate(db: &Database, args: Value) -> String {
+    let a: MigrateArgs = match serde_json::from_value(args) {
+        Ok(a) => a,
+        Err(e) => {
+            return json!({"error": format!("Invalid migrate arguments: {}", e)}).to_string()
+        }
+    };
+
+    match db.migrate_from_v0_1(&a.from_path) {
+        Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
+            json!({"error": format!("Migration report serialization failed: {}", e)}).to_string()
+        }),
+        Err(e) => json!({"error": format!("Migration failed: {}", e)}).to_string(),
+    }
+}
+
+pub fn handle_context(db: &Database, args: Value) -> String {
+    let a: ContextArgs = serde_json::from_value(args).unwrap_or(ContextArgs {
+        categories: vec![],
+        limit: 10,
+    });
+
+    match db.context(&a.categories, a.limit) {
+        Ok(markdown) => markdown,
+        Err(e) => format!("Context generation failed: {}", e),
+    }
+}
+
+pub fn handle_workspace_list(db: &Database) -> String {
+    match db.workspace_list_categories() {
+        Ok(cats) => json!({"categories": cats, "total": cats.len()}).to_string(),
+        Err(e) => json!({"error": format!("Workspace list failed: {}", e)}).to_string(),
     }
 }
