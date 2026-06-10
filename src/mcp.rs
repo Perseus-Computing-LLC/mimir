@@ -402,6 +402,45 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
                     }
                 },
                 {
+                    "name": "mimir_traverse",
+                    "description": "Traverse entity links starting from a given entity. Follows the relationship graph up to max_depth.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string", "description": "Starting entity category"},
+                            "key": {"type": "string", "description": "Starting entity key"},
+                            "max_depth": {"type": "integer", "default": 3, "description": "Maximum traversal depth"}
+                        },
+                        "required": ["category", "key"]
+                    }
+                },
+                {
+                    "name": "mimir_score",
+                    "description": "Score an entity's quality (0.0–1.0). High scores mark entities as verified and boost decay.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string", "description": "Entity category"},
+                            "key": {"type": "string", "description": "Entity key"},
+                            "score": {"type": "number", "description": "Quality score 0.0–1.0"}
+                        },
+                        "required": ["category", "key", "score"]
+                    }
+                },
+                {
+                    "name": "mimir_conflicts",
+                    "description": "Detect conflicting entities — entities in the same category with very different body_json (low trigram similarity).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string", "default": "general", "description": "Category to scan for conflicts"},
+                            "threshold": {"type": "number", "default": 0.4, "description": "Similarity below this = potential conflict"},
+                            "limit": {"type": "integer", "default": 10, "description": "Maximum conflicts to return"}
+                        },
+                        "required": ["category"]
+                    }
+                },
+                {
                     "name": "mimir_vault_export",
                     "description": "Export all non-archived entities to .md files with YAML frontmatter in a vault directory. Human-readable, git-trackable, Obsidian-compatible.",
                     "inputSchema": {
@@ -496,6 +535,9 @@ fn call_tool(
 
         "mimir_context" => Ok(tools::handle_context(db, args)),
 
+        "mimir_traverse" => Ok(tools::handle_traverse(db, args)),
+        "mimir_score" => Ok(tools::handle_score(db, args)),
+        "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_vault_export" => Ok(tools::handle_vault_export(db, args)),
         "mimir_vault_import" => Ok(tools::handle_vault_import(db, args)),
         "mimir_decay" => Ok(tools::handle_decay(db, args)),

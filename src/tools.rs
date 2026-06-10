@@ -546,6 +546,70 @@ pub fn handle_vault_import(db: &Database, args: Value) -> String {
     }
 }
 
+
+#[derive(Debug, Deserialize)]
+pub struct TraverseArgs {
+    pub category: String,
+    pub key: String,
+    #[serde(default = "default_depth")]
+    pub max_depth: i64,
+}
+
+fn default_depth() -> i64 { 3 }
+
+pub fn handle_traverse(db: &Database, args: Value) -> String {
+    let a: TraverseArgs = serde_json::from_value(args).unwrap_or(TraverseArgs {
+        category: "general".to_string(), key: "".to_string(), max_depth: 3,
+    });
+    match db.traverse_chain(&a.category, &a.key, a.max_depth) {
+        Ok(chain) => serde_json::to_string(&chain).unwrap_or_else(|e| {
+            json!({"error": format!("{}", e)}).to_string()
+        }),
+        Err(e) => json!({"error": format!("Traverse failed: {}", e)}).to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScoreArgs {
+    pub category: String,
+    pub key: String,
+    pub score: f64,
+}
+
+pub fn handle_score(db: &Database, args: Value) -> String {
+    let a: ScoreArgs = serde_json::from_value(args).unwrap_or(ScoreArgs {
+        category: "".to_string(), key: "".to_string(), score: 0.5,
+    });
+    match db.score_entity(&a.category, &a.key, a.score) {
+        Ok(found) => json!({"found": found, "category": a.category, "key": a.key, "score": a.score}).to_string(),
+        Err(e) => json!({"error": format!("Score failed: {}", e)}).to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConflictArgs {
+    pub category: String,
+    #[serde(default = "default_conflict_threshold")]
+    pub threshold: f64,
+    #[serde(default = "default_conflict_limit")]
+    pub limit: i64,
+}
+
+fn default_conflict_threshold() -> f64 { 0.4 }
+fn default_conflict_limit() -> i64 { 10 }
+
+pub fn handle_conflicts(db: &Database, args: Value) -> String {
+    let a: ConflictArgs = serde_json::from_value(args).unwrap_or(ConflictArgs {
+        category: "general".to_string(), threshold: 0.4, limit: 10,
+    });
+    match db.detect_conflicts(&a.category, a.threshold, a.limit) {
+        Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
+            json!({"error": format!("{}", e)}).to_string()
+        }),
+        Err(e) => json!({"error": format!("Conflict detection failed: {}", e)}).to_string(),
+    }
+}
+
 pub fn handle_decay(db: &Database, _args: Value) -> String {
     match db.decay_tick() {
         Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {

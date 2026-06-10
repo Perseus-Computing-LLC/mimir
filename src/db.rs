@@ -862,6 +862,187 @@ impl Database {
         schema::migrate_from_v0_1(old_path, &self.conn)
     }
 
+
+    // ─── Memory Synthesis ───────────────────────────────────────────
+
+    /// Traverse entity links starting from a given entity.
+    /// Returns the entity and all linked entities up to max_depth.
+    pub fn traverse_chain(
+        &self,
+        category: &str,
+        key: &str,
+        max_depth: i64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let root = match self.get_entity(category, key)? {
+            Some(e) => e,
+            None => return Ok(serde_json::json!({"error": "entity not found"})),
+        };
+
+        let mut visited = std::collections::HashSet::new();
+        let mut chain = serde_json::json!({
+            "entity": {
+                "id": root.id,
+                "category": root.category,
+                "key": root.key,
+                "body_json": root.body_json,
+                "links": []
+            },
+            "traversed": []
+        });
+
+        self._traverse_links(&root.id, &mut chain, &mut visited, max_depth, 0);
+        Ok(chain)
+    }
+
+    fn _traverse_links(
+        &self,
+        entity_id: &str,
+        parent: &mut serde_json::Value,
+        visited: &mut std::collections::HashSet<String>,
+        max_depth: i64,
+        current_depth: i64,
+    ) {
+        if current_depth >= max_depth || visited.contains(entity_id) {
+            return;
+        }
+        visited.insert(entity_id.to_string());
+
+        // Find linked entities
+        let links_json: String = self.conn.query_row(
+            "SELECT links FROM entities WHERE id = ?1",
+            params![entity_id],
+            |r| r.get(0),
+        ).unwrap_or_else(|_| "[]".to_string());
+
+        let links: Vec<MemoryLink> = serde_json::from_str(&links_json).unwrap_or_default();
+
+        for link in &links {
+            if let Ok(Some(entity)) = self.get_entity_by_id(&link.target_id) {
+                let child = serde_json::json!({
+                    "id": entity.id,
+                    "category": entity.category,
+                    "key": entity.key,
+                    "body_json": entity.body_json,
+                    "relationship": link.relationship,
+                    "links": []
+                });
+
+                if let Some(arr) = parent["traversed"].as_array_mut() {
+                    arr.push(child.clone());
+                }
+
+                let next = serde_json::json!({
+                    "id": entity.id,
+                    "category": entity.category,
+                    "key": entity.key,
+                    "body_json": entity.body_json,
+                    "relationship": link.relationship,
+                    "links": []
+                });
+
+                self._traverse_links(&entity.id, &mut next.clone(), visited, max_depth, current_depth + 1);
+            }
+        }
+    }
+
+    /// Get entity by ID (internal helper).
+    fn get_entity_by_id(&self, id: &str) -> Result<Option<Entity>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, category, key, body_json, status, type, tags,
+                    decay_score, retrieval_count, layer, topic_path,
+                    archived, archive_reason, links, verified, source,
+                    created_at_unix_ms, last_accessed_unix_ms
+             FROM entities WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            let tags_str: String = row.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string());
+            let links_str: String = row.get::<_, String>(13).unwrap_or_else(|_| "[]".to_string());
+            let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+            let links: Vec<MemoryLink> = serde_json::from_str(&links_str).unwrap_or_default();
+            let archived: i32 = row.get(11).unwrap_or(0);
+            let verified: i32 = row.get(14).unwrap_or(0);
+            Ok(Entity {
+                id: row.get(0)?, category: row.get(1)?, key: row.get(2)?,
+                body_json: row.get(3)?, status: row.get(4)?, entity_type: row.get(5)?,
+                tags, decay_score: row.get(7)?, retrieval_count: row.get(8)?,
+                layer: row.get(9)?, topic_path: row.get(10)?,
+                archived: archived != 0, archive_reason: row.get(12)?,
+                links, verified: verified != 0, source: row.get(15)?,
+                created_at_unix_ms: row.get(16)?, last_accessed_unix_ms: row.get(17)?,
+            })
+        })?;
+        if let Some(row) = rows.next() {
+            Ok(Some(row?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Score an entity's quality (0.0–1.0). Agents rate memories as useful/wrong.
+    pub fn score_entity(
+        &self,
+        category: &str,
+        key: &str,
+        score: f64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let score = score.clamp(0.0, 1.0);
+        let affected = self.conn.execute(
+            "UPDATE entities SET verified = ?1, decay_score = ?2,
+             last_accessed_unix_ms = ?3 WHERE category = ?4 AND key = ?5",
+            params![(score >= 0.7) as i32, score, now_ms(), category, key],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Detect conflicting entities — entities in the same category with very different body_json.
+    /// Returns pairs of entities with low trigram similarity (potential conflicts).
+    pub fn detect_conflicts(
+        &self,
+        category: &str,
+        threshold: f64,
+        limit: i64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, key, body_json FROM entities WHERE category = ?1 AND archived = 0 LIMIT 200"
+        )?;
+        let rows = stmt.query_map(params![category], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+
+        let entities: Vec<(String, String, String)> = rows.filter_map(|r| r.ok()).collect();
+        let mut conflicts = Vec::new();
+
+        for i in 0..entities.len() {
+            for j in (i+1)..entities.len() {
+                let (ref id1, ref key1, ref body1) = entities[i];
+                let (ref id2, ref key2, ref body2) = entities[j];
+                let sim = Self::trigram_similarity(body1, body2);
+                if sim < threshold {
+                    conflicts.push(serde_json::json!({
+                        "entity_a": {"id": id1, "key": key1},
+                        "entity_b": {"id": id2, "key": key2},
+                        "similarity": sim,
+                        "conflict_likely": sim < 0.3
+                    }));
+                    if conflicts.len() as i64 >= limit {
+                        break;
+                    }
+                }
+            }
+            if conflicts.len() as i64 >= limit {
+                break;
+            }
+        }
+
+        Ok(serde_json::json!({
+            "category": category,
+            "entities_compared": entities.len(),
+            "conflicts_found": conflicts.len(),
+            "threshold": threshold,
+            "conflicts": conflicts
+        }))
+    }
+
     /// Compact: archive entities below a decay threshold.
     pub fn compact(
         &self,
@@ -897,6 +1078,14 @@ impl Database {
         })
     }
 
+
+
+
+    // ─── Embedding Search (v0.3 — requires embedding feature) ───────
+    // Hybrid search with cosine similarity re-ranking.
+    // Enable with: cargo build --features embedding
+    // Requires OPENAI_API_KEY or compatible endpoint.
+    // See ROADMAP.md for full spec.
 
     // ─── Vault Export / Import ──────────────────────────────────────
 
