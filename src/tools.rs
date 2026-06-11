@@ -240,9 +240,14 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
+    let items_expanded: Vec<serde_json::Value> = entities
+        .iter()
+        .map(|e| e.to_json_expanded())
+        .collect();
+
     let result = json!({
-        "items": entities,
-        "total": entities.len(),
+        "items": items_expanded,
+        "total": items_expanded.len(),
     });
     Ok(result.to_string())
 }
