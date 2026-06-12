@@ -574,7 +574,9 @@ impl Database {
         key: &str,
         reason: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let affected = self.conn.execute(
+        // M-1 extended: wrap forget's entity UPDATE + FTS DELETE in a transaction
+        let tx = self.conn.unchecked_transaction()?;
+        let affected = tx.execute(
             "UPDATE entities SET archived = 1, archive_reason = ?1,
              last_accessed_unix_ms = ?2
              WHERE category = ?3 AND key = ?4 AND archived = 0",
@@ -582,11 +584,12 @@ impl Database {
         )?;
         // Clean FTS5 index for archived entity
         if affected > 0 {
-            let _ = self.conn.execute(
+            let _ = tx.execute(
                 "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE category = ?1 AND key = ?2)",
                 params![category, key],
             );
         }
+        tx.commit()?;
         Ok(affected > 0)
     }
 
@@ -1120,17 +1123,20 @@ impl Database {
                 |r| r.get(0),
             )?
         } else {
-            let count = self.conn.execute(
+            // M-1 extended: wrap compact UPDATE + FTS DELETE in a transaction
+            let tx = self.conn.unchecked_transaction()?;
+            let count = tx.execute(
                 "UPDATE entities SET archived = 1, archive_reason = 'decay threshold',
                  last_accessed_unix_ms = ?1
                  WHERE archived = 0 AND decay_score < ?2",
                 params![now_ms(), min_decay],
             )? as i64;
             // Clean FTS5 index for compacted entities
-            let _ = self.conn.execute(
+            let _ = tx.execute(
                 "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE archived = 1 AND archive_reason = 'decay threshold')",
                 [],
             );
+            tx.commit()?;
             count
         };
 
