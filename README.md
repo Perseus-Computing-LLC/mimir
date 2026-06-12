@@ -88,7 +88,7 @@ mimir:
 
 ---
 
-## MCP Tools (v0.2.0)
+## MCP Tools (v0.5.0)
 
 ### Entity tools
 
@@ -192,7 +192,7 @@ Categories are user-defined. Common patterns:
 - **Journal events** — append-only log with evaluated/acted/forward structure
 - **State with TTL** — key-value store with automatic expiration
 - **Entity linking** — create navigable relationships between entities
-- **FTS5 keyword search** — BM25-ranked results with LIKE fallback
+- **FTS5 keyword search** — FTS5 keyword filtering with LIKE fallback; results are ranked by retrieval count and recency (not BM25)
 - **No LLM required** — stores and retrieves directly; no embeddings needed
 - **MCP-native** — standard JSON-RPC 2.0 over stdio
 - **Single-file database** — one SQLite file; easy to backup, copy, or inspect
@@ -208,12 +208,14 @@ ever. The binary never dials home. You own every byte.
 
 ## Roadmap
 
-**Current:** v0.2.0 — structured entity model with journal + state
+**Current:** v0.5.0 — 23 tools over stdio JSON-RPC 2.0, with decay, layer
+progression, knowledge graph, journal/state, conflict detection, and vault
+import/export.
 
 | Feature | Status |
 |---|---|
 | MCP JSON-RPC 2.0 stdio server | ✅ |
-| FTS5 keyword search + LIKE fallback | ✅ |
+| FTS5 keyword filtering + LIKE fallback | ✅ |
 | Structured entity model (category/key) | ✅ v0.2.0 |
 | Category-filtered recall | ✅ v0.2.0 |
 | Journal events (evaluated/acted/forward) | ✅ v0.2.0 |
@@ -222,12 +224,19 @@ ever. The binary never dials home. You own every byte.
 | Soft-delete (mimir_forget) | ✅ v0.2.0 |
 | Context injection for session start | ✅ v0.2.0 |
 | Migration from v0.1.x | ✅ v0.2.0 |
-| Ebbinghaus decay algorithm | 🔜 v0.2.1 |
-| Layer promotion (buffer → working → core) | 🔜 v0.2.1 |
-| Embedding-based vector search | 🔜 v0.3 |
-| `.md` vault export/import | 🔜 v0.3 |
-| Cross-workspace federation | 🔜 v0.4 |
-| SSE transport | 🔜 v0.4 |
+| Ebbinghaus decay algorithm | ✅ v0.5.0 |
+| Layer progression (buffer → working → core) | ✅ v0.5.0 |
+| `.md` vault export/import | ✅ v0.5.0 |
+| Conflict detection (mimir_conflicts) | ✅ v0.5.0 |
+| Quality scoring (mimir_score) | ✅ v0.5.0 |
+| Graph traversal (mimir_traverse) | ✅ v0.5.0 |
+| Embedding-based vector search | 🔜 future |
+| BM25 / relevance ranking for recall | 🔜 future |
+| Cross-workspace federation | 🔜 future |
+| SSE transport | 🔜 future |
+
+**Known limitations:** recall ranks by retrieval count and recency rather than
+BM25 relevance; embedding/vector search is not yet implemented.
 
 ---
 

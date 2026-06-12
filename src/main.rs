@@ -72,7 +72,7 @@ fn main() {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&report).unwrap_or_else(|_| {
-                            format!("Migration complete (report serialization failed)")
+                            "Migration complete (report serialization failed)".to_string()
                         })
                     );
                 }

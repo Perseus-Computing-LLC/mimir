@@ -161,6 +161,15 @@ fn default_min_decay() -> f64 {
     0.1
 }
 
+impl Default for CompactArgs {
+    fn default() -> Self {
+        Self {
+            min_decay: default_min_decay(),
+            dry_run: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MigrateArgs {
     pub from_path: String,
@@ -178,7 +187,31 @@ fn default_context_limit() -> i64 {
     10
 }
 
+impl Default for ContextArgs {
+    fn default() -> Self {
+        Self {
+            categories: Vec::new(),
+            limit: default_context_limit(),
+        }
+    }
+}
+
 // ─── Tool handlers ──────────────────────────────────────────────
+
+/// Deserialize tool arguments, falling back to `T::default()` only when no
+/// arguments were supplied (null or `{}`). Any other malformed input is a real
+/// error and is reported instead of being silently coerced to defaults. This
+/// matters most for destructive tools where a default could mutate data.
+fn parse_args_or_default<T>(args: Value) -> Result<T, serde_json::Error>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    match &args {
+        Value::Null => Ok(T::default()),
+        Value::Object(map) if map.is_empty() => Ok(T::default()),
+        _ => serde_json::from_value(args),
+    }
+}
 
 pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     let a: RememberArgs =
@@ -209,16 +242,38 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         last_accessed_unix_ms: now,
     };
 
+    let requested_category = entity.category.clone();
+    let requested_key = entity.key.clone();
+
     let (eid, action) = db
         .remember(&entity)
         .map_err(|e| format!("Remember failed: {}", e))?;
 
-    let result = json!({
-        "id": eid,
-        "action": action,
-        "category": entity.category,
-        "key": entity.key,
-    });
+    let result = if action == "deduped" {
+        // A near-duplicate already existed, so no new (category, key) was created.
+        // Report the existing entity's actual identity rather than echoing the
+        // requested key, which would falsely imply the requested key now exists.
+        let existing = db.get_entity_by_id_public(&eid).ok().flatten();
+        let (existing_category, existing_key) = existing
+            .map(|e| (e.category, e.key))
+            .unwrap_or((requested_category.clone(), requested_key.clone()));
+        json!({
+            "id": eid,
+            "action": action,
+            "category": existing_category,
+            "key": existing_key,
+            "requested_category": requested_category,
+            "requested_key": requested_key,
+            "note": "A near-duplicate already existed; no new key was created. The existing entity was reinforced and its id/category/key are returned above.",
+        })
+    } else {
+        json!({
+            "id": eid,
+            "action": action,
+            "category": entity.category,
+            "key": entity.key,
+        })
+    };
     Ok(result.to_string())
 }
 
@@ -234,16 +289,15 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         min_decay: a.min_decay,
         topic_path: a.topic_path,
         include_archived: a.include_archived,
+        bump: true,
     };
 
     let entities = db
         .recall(&params)
         .map_err(|e| format!("Recall failed: {}", e))?;
 
-    let items_expanded: Vec<serde_json::Value> = entities
-        .iter()
-        .map(|e| e.to_json_expanded())
-        .collect();
+    let items_expanded: Vec<serde_json::Value> =
+        entities.iter().map(|e| e.to_json_expanded()).collect();
 
     let result = json!({
         "items": items_expanded,
@@ -420,8 +474,8 @@ pub fn handle_state_get(db: &Database, args: Value) -> Result<String, String> {
 }
 
 pub fn handle_state_delete(db: &Database, args: Value) -> Result<String, String> {
-    let a: StateDeleteArgs =
-        serde_json::from_value(args).map_err(|e| format!("Invalid state_delete arguments: {}", e))?;
+    let a: StateDeleteArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid state_delete arguments: {}", e))?;
 
     let found = db
         .state_delete(&a.key)
@@ -467,10 +521,13 @@ pub fn handle_stats(db: &Database) -> String {
 }
 
 pub fn handle_compact(db: &Database, args: Value) -> String {
-    let a: CompactArgs = serde_json::from_value(args).unwrap_or(CompactArgs {
-        min_decay: 0.1,
-        dry_run: false,
-    });
+    // Reject malformed arguments rather than silently defaulting. compact is
+    // destructive (archives rows), so e.g. {"dry_run":"yes"} must not be
+    // misinterpreted as a real compaction with dry_run=false.
+    let a: CompactArgs = match parse_args_or_default(args) {
+        Ok(a) => a,
+        Err(e) => return json!({"error": format!("Invalid compact arguments: {}", e)}).to_string(),
+    };
 
     match db.compact(a.min_decay, a.dry_run) {
         Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
@@ -483,9 +540,7 @@ pub fn handle_compact(db: &Database, args: Value) -> String {
 pub fn handle_migrate(db: &Database, args: Value) -> String {
     let a: MigrateArgs = match serde_json::from_value(args) {
         Ok(a) => a,
-        Err(e) => {
-            return json!({"error": format!("Invalid migrate arguments: {}", e)}).to_string()
-        }
+        Err(e) => return json!({"error": format!("Invalid migrate arguments: {}", e)}).to_string(),
     };
 
     match db.migrate_from_v0_1(&a.from_path) {
@@ -497,10 +552,10 @@ pub fn handle_migrate(db: &Database, args: Value) -> String {
 }
 
 pub fn handle_context(db: &Database, args: Value) -> String {
-    let a: ContextArgs = serde_json::from_value(args).unwrap_or(ContextArgs {
-        categories: vec![],
-        limit: 10,
-    });
+    let a: ContextArgs = match parse_args_or_default(args) {
+        Ok(a) => a,
+        Err(e) => return format!("Invalid context arguments: {}", e),
+    };
 
     match db.context(&a.categories, a.limit) {
         Ok(markdown) => markdown,
@@ -508,17 +563,37 @@ pub fn handle_context(db: &Database, args: Value) -> String {
     }
 }
 
-
-
 #[derive(Debug, Deserialize)]
 pub struct VaultExportArgs {
+    #[serde(default = "default_vault_dir")]
     pub vault_dir: String,
 }
 
+fn default_vault_dir() -> String {
+    "~/.mimir/vault".to_string()
+}
+
+/// Parse vault tool args, defaulting `vault_dir` only when no args are supplied
+/// and erroring on otherwise-malformed input.
+fn parse_vault_args(args: Value) -> Result<VaultExportArgs, serde_json::Error> {
+    match &args {
+        Value::Null => Ok(VaultExportArgs {
+            vault_dir: default_vault_dir(),
+        }),
+        Value::Object(map) if map.is_empty() => Ok(VaultExportArgs {
+            vault_dir: default_vault_dir(),
+        }),
+        _ => serde_json::from_value(args),
+    }
+}
+
 pub fn handle_vault_export(db: &Database, args: Value) -> String {
-    let a: VaultExportArgs = serde_json::from_value(args).unwrap_or(VaultExportArgs {
-        vault_dir: "~/.mimir/vault".to_string(),
-    });
+    let a: VaultExportArgs = match parse_vault_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            return json!({"error": format!("Invalid vault_export arguments: {}", e)}).to_string()
+        }
+    };
     let dir = if a.vault_dir.starts_with("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         a.vault_dir.replacen("~", &home, 1)
@@ -534,9 +609,12 @@ pub fn handle_vault_export(db: &Database, args: Value) -> String {
 }
 
 pub fn handle_vault_import(db: &Database, args: Value) -> String {
-    let a: VaultExportArgs = serde_json::from_value(args).unwrap_or(VaultExportArgs {
-        vault_dir: "~/.mimir/vault".to_string(),
-    });
+    let a: VaultExportArgs = match parse_vault_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            return json!({"error": format!("Invalid vault_import arguments: {}", e)}).to_string()
+        }
+    };
     let dir = if a.vault_dir.starts_with("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         a.vault_dir.replacen("~", &home, 1)
@@ -551,7 +629,6 @@ pub fn handle_vault_import(db: &Database, args: Value) -> String {
     }
 }
 
-
 #[derive(Debug, Deserialize)]
 pub struct TraverseArgs {
     pub category: String,
@@ -560,16 +637,20 @@ pub struct TraverseArgs {
     pub max_depth: i64,
 }
 
-fn default_depth() -> i64 { 3 }
+fn default_depth() -> i64 {
+    3
+}
 
 pub fn handle_traverse(db: &Database, args: Value) -> String {
-    let a: TraverseArgs = serde_json::from_value(args).unwrap_or(TraverseArgs {
-        category: "general".to_string(), key: "".to_string(), max_depth: 3,
-    });
+    let a: TraverseArgs = match serde_json::from_value(args) {
+        Ok(a) => a,
+        Err(e) => {
+            return json!({"error": format!("Invalid traverse arguments: {}", e)}).to_string()
+        }
+    };
     match db.traverse_chain(&a.category, &a.key, a.max_depth) {
-        Ok(chain) => serde_json::to_string(&chain).unwrap_or_else(|e| {
-            json!({"error": format!("{}", e)}).to_string()
-        }),
+        Ok(chain) => serde_json::to_string(&chain)
+            .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
         Err(e) => json!({"error": format!("Traverse failed: {}", e)}).to_string(),
     }
 }
@@ -582,11 +663,15 @@ pub struct ScoreArgs {
 }
 
 pub fn handle_score(db: &Database, args: Value) -> String {
-    let a: ScoreArgs = serde_json::from_value(args).unwrap_or(ScoreArgs {
-        category: "".to_string(), key: "".to_string(), score: 0.5,
-    });
+    let a: ScoreArgs = match serde_json::from_value(args) {
+        Ok(a) => a,
+        Err(e) => return json!({"error": format!("Invalid score arguments: {}", e)}).to_string(),
+    };
     match db.score_entity(&a.category, &a.key, a.score) {
-        Ok(found) => json!({"found": found, "category": a.category, "key": a.key, "score": a.score}).to_string(),
+        Ok(found) => {
+            json!({"found": found, "category": a.category, "key": a.key, "score": a.score})
+                .to_string()
+        }
         Err(e) => json!({"error": format!("Score failed: {}", e)}).to_string(),
     }
 }
@@ -600,17 +685,23 @@ pub struct ConflictArgs {
     pub limit: i64,
 }
 
-fn default_conflict_threshold() -> f64 { 0.4 }
-fn default_conflict_limit() -> i64 { 10 }
+fn default_conflict_threshold() -> f64 {
+    0.4
+}
+fn default_conflict_limit() -> i64 {
+    10
+}
 
 pub fn handle_conflicts(db: &Database, args: Value) -> String {
-    let a: ConflictArgs = serde_json::from_value(args).unwrap_or(ConflictArgs {
-        category: "general".to_string(), threshold: 0.4, limit: 10,
-    });
+    let a: ConflictArgs = match serde_json::from_value(args) {
+        Ok(a) => a,
+        Err(e) => {
+            return json!({"error": format!("Invalid conflicts arguments: {}", e)}).to_string()
+        }
+    };
     match db.detect_conflicts(&a.category, a.threshold, a.limit) {
-        Ok(report) => serde_json::to_string(&report).unwrap_or_else(|e| {
-            json!({"error": format!("{}", e)}).to_string()
-        }),
+        Ok(report) => serde_json::to_string(&report)
+            .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
         Err(e) => json!({"error": format!("Conflict detection failed: {}", e)}).to_string(),
     }
 }
