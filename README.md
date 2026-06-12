@@ -88,7 +88,7 @@ mimir:
 
 ---
 
-## MCP Tools (v0.2.0)
+## MCP Tools (v0.5.0)
 
 ### Entity tools
 
@@ -126,6 +126,22 @@ mimir:
 | `mimir_migrate` | Migrate a v0.1.x database to v0.2.0 schema. |
 | `mimir_context` | Return pre-formatted markdown context block for session injection. |
 | `mimir_workspace_list` | List all distinct entity categories. |
+
+### Graph & analysis tools
+
+| Tool | Description |
+|---|---|
+| `mimir_traverse` | Walk entity link graph from a starting entity up to configurable depth. |
+| `mimir_score` | Assign a quality score (0.0–1.0) to an entity to resist decay. |
+| `mimir_conflicts` | Detect conflicting entities in the same category using trigram similarity. |
+| `mimir_decay` | Recalculate Ebbinghaus decay scores and auto-archive fully decayed entities. |
+
+### Vault tools
+
+| Tool | Description |
+|---|---|
+| `mimir_vault_export` | Export all non-archived entities to .md files with YAML frontmatter. |
+| `mimir_vault_import` | Import entities from .md files in a vault directory (idempotent). |
 
 ---
 

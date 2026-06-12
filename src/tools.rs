@@ -184,6 +184,11 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     let a: RememberArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid remember arguments: {}", e))?;
 
+    // Validate body_json is valid JSON
+    if let Err(e) = serde_json::from_str::<serde_json::Value>(&a.body_json) {
+        return Err(format!("body_json is not valid JSON: {}", e));
+    }
+
     let raw_id = Uuid::new_v4().to_string().replace('-', "");
     let id = format!("mem-{}", &raw_id[..12]);
     let now = now_ms();
@@ -499,8 +504,11 @@ pub fn handle_context(db: &Database, args: Value) -> String {
     });
 
     match db.context(&a.categories, a.limit) {
-        Ok(markdown) => markdown,
-        Err(e) => format!("Context generation failed: {}", e),
+        Ok(markdown) => {
+            let total_chars = markdown.len();
+            json!({"markdown": markdown, "total_chars": total_chars}).to_string()
+        }
+        Err(e) => json!({"error": format!("Context generation failed: {}", e)}).to_string(),
     }
 }
 
@@ -599,6 +607,8 @@ pub struct ConflictArgs {
     pub threshold: f64,
     #[serde(default = "default_conflict_limit")]
     pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
 fn default_conflict_threshold() -> f64 {
@@ -613,8 +623,9 @@ pub fn handle_conflicts(db: &Database, args: Value) -> String {
         category: "general".to_string(),
         threshold: 0.4,
         limit: 10,
+        offset: 0,
     });
-    match db.detect_conflicts(&a.category, a.threshold, a.limit) {
+    match db.detect_conflicts(&a.category, a.threshold, a.limit, a.offset) {
         Ok(report) => serde_json::to_string(&report)
             .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
         Err(e) => json!({"error": format!("Conflict detection failed: {}", e)}).to_string(),

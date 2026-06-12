@@ -126,6 +126,11 @@ impl Database {
                     params![id],
                 )?;
                 auto_archived += 1;
+                // Clean FTS5 index for auto-archived entity
+                let _ = self.conn.execute(
+                    "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+                    params![id],
+                );
             }
         }
 
@@ -235,8 +240,16 @@ impl Database {
                     |r| r.get(0),
                 )
                 .unwrap_or(1.0);
+            let old_count: i64 = self
+                .conn
+                .query_row(
+                    "SELECT retrieval_count FROM entities WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             let boosted = Self::boost_decay(old_decay);
-            let new_layer = Self::compute_layer(entity.retrieval_count + 1);
+            let new_layer = Self::compute_layer(old_count + 1);
             self.conn.execute(
                 "UPDATE entities SET
                     body_json = ?1, status = ?2, type = ?3, tags = ?4,
@@ -576,6 +589,13 @@ impl Database {
              WHERE category = ?3 AND key = ?4 AND archived = 0",
             params![reason, now_ms(), category, key],
         )?;
+        // Clean FTS5 index for archived entity
+        if affected > 0 {
+            let _ = self.conn.execute(
+                "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE category = ?1 AND key = ?2)",
+                params![category, key],
+            );
+        }
         Ok(affected > 0)
     }
 
@@ -600,31 +620,30 @@ impl Database {
             )
             .map_err(|_| "Target entity not found")?;
 
-        // Check for duplicate link
-        let existing: Option<String> = self
+        // Get existing links (default to empty array if missing)
+        let links_str: String = self
             .conn
             .query_row(
                 "SELECT links FROM entities WHERE id = ?1",
                 params![from.id],
                 |r| r.get(0),
             )
-            .ok();
-        if let Some(links_str) = existing {
-            let mut links: Vec<MemoryLink> = serde_json::from_str(&links_str).unwrap_or_default();
-            // Avoid duplicates
-            if !links.iter().any(|l| l.target_id == to_id) {
-                links.push(MemoryLink {
-                    target_id: to_id.to_string(),
-                    relationship: relationship.to_string(),
-                    weight: 0.5,
-                });
-            }
-            let new_links = serde_json::to_string(&links)?;
-            self.conn.execute(
-                "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
-                params![new_links, now_ms(), from.id],
-            )?;
+            .unwrap_or_else(|_| "[]".to_string());
+
+        let mut links: Vec<MemoryLink> = serde_json::from_str(&links_str).unwrap_or_default();
+        // Avoid duplicates
+        if !links.iter().any(|l| l.target_id == to_id) {
+            links.push(MemoryLink {
+                target_id: to_id.to_string(),
+                relationship: relationship.to_string(),
+                weight: 0.5,
+            });
         }
+        let new_links = serde_json::to_string(&links)?;
+        self.conn.execute(
+            "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
+            params![new_links, now_ms(), from.id],
+        )?;
 
         Ok(())
     }
@@ -1062,11 +1081,13 @@ impl Database {
         category: &str,
         threshold: f64,
         limit: i64,
+        offset: i64,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, key, body_json FROM entities WHERE category = ?1 AND archived = 0 LIMIT 200"
+            "SELECT id, key, body_json FROM entities WHERE category = ?1 AND archived = 0
+             ORDER BY last_accessed_unix_ms DESC LIMIT 200 OFFSET ?2"
         )?;
-        let rows = stmt.query_map(params![category], |r| {
+        let rows = stmt.query_map(params![category, offset], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1127,12 +1148,18 @@ impl Database {
                 |r| r.get(0),
             )?
         } else {
-            self.conn.execute(
+            let count = self.conn.execute(
                 "UPDATE entities SET archived = 1, archive_reason = 'decay threshold',
                  last_accessed_unix_ms = ?1
                  WHERE archived = 0 AND decay_score < ?2",
                 params![now_ms(), min_decay],
-            )? as i64
+            )? as i64;
+            // Clean FTS5 index for compacted entities
+            let _ = self.conn.execute(
+                "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE archived = 1 AND archive_reason = 'decay threshold')",
+                [],
+            );
+            count
         };
 
         Ok(CompactReport {
@@ -1350,7 +1377,8 @@ last_accessed: {}
 
             let entity = Entity {
                 id: if id.is_empty() {
-                    uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()
+                    let raw = uuid::Uuid::new_v4().to_string().replace('-', "");
+                    format!("mem-{}", &raw[..12])
                 } else {
                     id
                 },

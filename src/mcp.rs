@@ -332,7 +332,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       }
     },
     "annotations": {
-      "destructiveHint": true
+      "readOnlyHint": true
     }
   },
   {
@@ -937,11 +937,20 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
       "required": []
     },
     "outputSchema": {
-      "type": "string",
-      "description": "Markdown-formatted context block with entity details"
+      "type": "object",
+      "properties": {
+        "markdown": {
+          "type": "string",
+          "description": "Markdown-formatted context block with entity details"
+        },
+        "total_chars": {
+          "type": "integer",
+          "description": "Character count of the markdown content"
+        }
+      }
     },
     "annotations": {
-      "destructiveHint": true
+      "readOnlyHint": true
     }
   },
   {
@@ -1060,6 +1069,11 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "type": "integer",
           "default": 10,
           "description": "Maximum number of conflicts to return"
+        },
+        "offset": {
+          "type": "integer",
+          "default": 0,
+          "description": "Number of entities to skip for pagination"
         }
       },
       "required": [
