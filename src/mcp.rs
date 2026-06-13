@@ -449,6 +449,45 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     }
   },
   {
+    "name": "mimir_ingest",
+    "description": "Sync external data connectors (GitHub issues, file watcher) into Mimir. Call with no arguments to run all enabled connectors, or specify a connector name to run only that one. Use dry_run=true to preview without storing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "connector": {
+          "type": "string",
+          "description": "Specific connector to run (omit for all enabled)"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": false,
+          "description": "Preview documents without storing them"
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ingested": {
+          "type": "integer",
+          "description": "Number of documents ingested (or would be ingested in dry run)"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "Whether this was a dry run"
+        },
+        "errors": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Error messages from connectors that failed"
+        }
+      }
+    },
+    "annotations": {
+      "destructiveHint": true
+    }
+  },
+  {
     "name": "mimir_link",
     "description": "Create a relationship link from one entity to another. Builds a knowledge graph that mimir_traverse can walk. Use 'depends_on', 'implements', 'extends', 'references', or custom relationships.",
     "inputSchema": {
@@ -1352,6 +1391,10 @@ fn call_tool(
 
         "mimir_forget" => {
             tools::handle_forget(db, args).map_err(|e| error_response(id, -32603, &e))
+        }
+
+        "mimir_ingest" => {
+            tools::handle_ingest(db, args).map_err(|e| error_response(id, -32603, &e))
         }
 
         "mimir_link" => tools::handle_link(db, args).map_err(|e| error_response(id, -32603, &e)),

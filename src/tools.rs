@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::db::{now_ms, Database};
 use crate::models::{
-    AskParams, Entity, JournalEvent, RecallParams, StateEntry, TimelineParams,
+    AskParams, Entity, IngestParams, JournalEvent, RecallParams, StateEntry, TimelineParams,
 };
 
 // ─── Deserialization structs ────────────────────────────────────
@@ -757,6 +757,16 @@ pub fn handle_ask(db: &Database, args: Value) -> Result<String, String> {
         Ok(result) => serde_json::to_string(&result)
             .map_err(|e| format!("Serialization failed: {}", e)),
         Err(e) => Err(format!("Ask failed: {}", e)),
+    }
+}
+
+pub fn handle_ingest(db: &Database, args: Value) -> Result<String, String> {
+    let params: IngestParams =
+        serde_json::from_value(args).map_err(|e| format!("Invalid ingest arguments: {}", e))?;
+
+    match db.ingest(&params) {
+        Ok(result) => Ok(result.to_string()),
+        Err(e) => Err(format!("Ingest failed: {}", e)),
     }
 }
 

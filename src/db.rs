@@ -1,10 +1,12 @@
 use rusqlite::{params, Connection};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::connectors::Connector;
 use crate::encryption::EncryptionManager;
 use crate::models::{
     AskParams, AskResult, AskSource, CompactReport, DecayReport, Entity, GraphEdge, GraphNode,
-    JournalEvent, MemoryLink, RecallParams, StateEntry, Stats, TimelineParams, VaultReport,
+    IngestParams, JournalEvent, MemoryLink, RecallParams, StateEntry, Stats,
+    TimelineParams, VaultReport,
 };
 use crate::schema;
 
@@ -56,6 +58,7 @@ pub struct Database {
     db_path: String,
     encryption: Option<EncryptionManager>,
     llm_config: LlmConfig,
+    pub connectors: Vec<Box<dyn Connector>>,
 }
 
 /// Configuration for the LLM integration (Ollama API).
@@ -94,6 +97,7 @@ impl Database {
             db_path: path.to_string(),
             encryption: None,
             llm_config: LlmConfig::default(),
+            connectors: Vec::new(),
         })
     }
 
@@ -200,6 +204,72 @@ impl Database {
             .to_string();
 
         Ok(AskResult { answer, sources })
+    }
+
+    /// Run connector ingestion: fetch documents from external sources and store as entities.
+    pub fn ingest(&self, params: &IngestParams) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        if self.connectors.is_empty() {
+            return Err("No connectors configured. Add connectors to enable ingestion.".into());
+        }
+
+        let mut ingested = 0u64;
+        let mut errors = Vec::new();
+        let now = crate::db::now_ms();
+
+        for i in 0..self.connectors.len() {
+            let name = self.connectors[i].name().to_string();
+
+            if let Some(ref requested) = params.connector {
+                if name != *requested {
+                    continue;
+                }
+            }
+
+            let fetch_result = self.connectors[i].fetch();
+            match fetch_result {
+                Ok(docs) => {
+                    if params.dry_run {
+                        ingested += docs.len() as u64;
+                        continue;
+                    }
+                    for doc in docs {
+                        let entity = Entity {
+                            id: format!("ingest-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string()),
+                            category: doc.category,
+                            key: doc.key,
+                            body_json: doc.body_json,
+                            status: "active".to_string(),
+                            entity_type: "insight".to_string(),
+                            tags: doc.tags,
+                            decay_score: 1.0,
+                            retrieval_count: 0,
+                            layer: "buffer".to_string(),
+                            topic_path: String::new(),
+                            archived: false,
+                            archive_reason: String::new(),
+                            links: vec![],
+                            verified: false,
+                            source: format!("connector:{}", name),
+                            created_at_unix_ms: now,
+                            last_accessed_unix_ms: now,
+                        };
+                        match self.remember(&entity) {
+                            Ok(_) => ingested += 1,
+                            Err(e) => errors.push(format!("{}/{}: {}", name, entity.key, e)),
+                        }
+                    }
+                    self.connectors[i].last_sync().store(now, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(e) => errors.push(format!("{}: {}", name, e)),
+            }
+        }
+
+        let result = serde_json::json!({
+            "ingested": ingested,
+            "dry_run": params.dry_run,
+            "errors": errors,
+        });
+        Ok(result)
     }
 
     // ─── Decay & Layer Progression ──────────────────────────────────

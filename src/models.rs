@@ -296,3 +296,21 @@ pub struct AskSource {
     pub score: f64,
     pub snippet: String,
 }
+
+/// Parameters for the mimir_ingest connector sync tool.
+#[derive(Debug, Deserialize)]
+pub struct IngestParams {
+    /// Specific connector to run (None = all enabled connectors).
+    pub connector: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// A raw document from an external connector before it becomes an entity.
+#[derive(Debug, Clone)]
+pub struct RawDocument {
+    pub key: String,
+    pub category: String,
+    pub body_json: String,
+    pub tags: Vec<String>,
+}

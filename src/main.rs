@@ -1,3 +1,4 @@
+mod connectors;
 mod db;
 mod encryption;
 mod mcp;
@@ -42,6 +43,10 @@ struct Cli {
     #[arg(long, default_value_t = String::from("llama3"))]
     llm_model: String,
 
+    /// Path to connectors.yaml config file for external connectors
+    #[arg(long)]
+    connectors_config: Option<String>,
+
     /// Deprecated compatibility flag; MCP stdio mode is always enabled
     #[arg(long = "mcp", default_value_t = false, hide = true)]
     _mcp: bool,
@@ -74,6 +79,10 @@ enum Commands {
         /// Ollama model name (default: llama3)
         #[arg(long, default_value_t = String::from("llama3"))]
         llm_model: String,
+
+        /// Path to connectors.yaml config file for external connectors
+        #[arg(long)]
+        connectors_config: Option<String>,
 
         /// Deprecated compatibility flag; MCP stdio mode is always enabled
         #[arg(long = "mcp", default_value_t = false, hide = true)]
@@ -184,7 +193,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref llm_endpoint, ref llm_model, .. }) => {
+        Some(Commands::Serve { ref db, ref encryption_key, ref web, ref port, ref llm_endpoint, ref llm_model, ref connectors_config, .. }) => {
             let db_path = db.clone();
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
@@ -205,6 +214,18 @@ fn main() {
             if let Some(ref endpoint) = llm_endpoint {
                 database.set_llm(true, endpoint, llm_model);
                 eprintln!("mimir: LLM enabled (endpoint: {}, model: {})", endpoint, llm_model);
+            }
+
+            // Load connectors from YAML config if provided
+            if let Some(ref config_path) = connectors_config {
+                match load_connectors(config_path) {
+                    Ok(connectors) => {
+                        let count = connectors.len();
+                        database.connectors = connectors;
+                        eprintln!("mimir: loaded {} connector(s) from {}", count, config_path);
+                    }
+                    Err(e) => eprintln!("mimir: failed to load connectors: {}", e),
+                }
             }
 
             // Start web dashboard in background if requested
@@ -255,6 +276,17 @@ fn main() {
                 eprintln!("mimir: LLM enabled (endpoint: {}, model: {})", endpoint, cli.llm_model);
             }
 
+            if let Some(ref config_path) = cli.connectors_config {
+                match load_connectors(config_path) {
+                    Ok(connectors) => {
+                        let count = connectors.len();
+                        database.connectors = connectors;
+                        eprintln!("mimir: loaded {} connector(s) from {}", count, config_path);
+                    }
+                    Err(e) => eprintln!("mimir: failed to load connectors: {}", e),
+                }
+            }
+
             if cli.web {
                 let web_port = cli.port;
                 let web_db = match db::Database::open(&db_path) {
@@ -281,6 +313,75 @@ fn main() {
             mcp::run_server(database);
         }
     }
+}
+
+fn load_connectors(path: &str) -> Result<Vec<Box<dyn crate::connectors::Connector>>, String> {
+    let expanded = if path.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/root".to_string());
+        path.replacen("~", &home, 1)
+    } else {
+        path.to_string()
+    };
+    let contents = std::fs::read_to_string(&expanded)
+        .map_err(|e| format!("Cannot read connectors config {}: {}", expanded, e))?;
+    let config: serde_yaml::Value = serde_yaml::from_str(&contents)
+        .map_err(|e| format!("Invalid YAML in {}: {}", expanded, e))?;
+
+    let mut connectors: Vec<Box<dyn crate::connectors::Connector>> = Vec::new();
+
+    // Load GitHub connector if configured
+    if let Some(github) = config.get("connectors").and_then(|c| c.get("github")) {
+        let enabled = github.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        if enabled {
+            let token = github.get("token").and_then(|v| v.as_str()).unwrap_or("");
+            let repos: Vec<String> = github
+                .get("repos")
+                .and_then(|v| v.as_sequence())
+                .map(|s| s.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let days_past = github.get("days_past").and_then(|v| v.as_u64()).unwrap_or(90) as u32;
+            let max_items = github.get("max_items_per_repo").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
+
+            let gcfg = crate::connectors::github::GitHubConnectorConfig {
+                enabled: true,
+                token: token.to_string(),
+                repos,
+                days_past,
+                max_items_per_repo: max_items,
+            };
+            connectors.push(Box::new(crate::connectors::github::GitHubConnector::new(gcfg)));
+        }
+    }
+
+    // Load file watcher connector if configured
+    if let Some(fw) = config.get("connectors").and_then(|c| c.get("file_watcher")) {
+        let enabled = fw.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        if enabled {
+            let paths: Vec<String> = fw
+                .get("paths")
+                .and_then(|v| v.as_sequence())
+                .map(|s| s.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let extensions: Vec<String> = fw
+                .get("extensions")
+                .and_then(|v| v.as_sequence())
+                .map(|s| s.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_else(|| vec![".md".to_string(), ".txt".to_string()]);
+            let debounce_ms = fw.get("debounce_ms").and_then(|v| v.as_u64()).unwrap_or(1500);
+
+            let fcfg = crate::connectors::file_watcher::FileWatcherConfig {
+                enabled: true,
+                paths,
+                extensions,
+                debounce_ms,
+            };
+            connectors.push(Box::new(crate::connectors::file_watcher::FileWatcher::new(fcfg)));
+        }
+    }
+
+    Ok(connectors)
 }
 
 #[cfg(test)]
