@@ -1,0 +1,51 @@
+name: PR Pilot — Autonomous Code Review
+
+# SECURITY: this workflow must never execute PR-controlled code while it holds
+# secrets. PR Pilot only needs the PR diff, which it fetches through the GitHub
+# API (data, not code). We therefore check out the BASE ref (trusted code on the
+# target branch) and run the agent from there, passing only the PR number.
+#
+# Using `pull_request` (not `pull_request_target`) means forked PRs do not
+# receive secrets at all. Checking out the base ref additionally protects
+# against same-repo or compromised-write PRs that try to modify the workflow's
+# code path to exfiltrate GEMINI_API_KEY or abuse the write token.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Least privilege: only what is needed to post a review.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-pilot-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the BASE ref (trusted), NOT the PR head. The PR's code is
+      # never installed or executed in this job.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (from trusted base ref)
+        run: pip install -e .
+
+      - name: Run PR Pilot Agent Chain
+        # cli.py reads PR context from GITHUB_EVENT_PATH and the PR diff from the
+        # API, so it never needs the PR's checked-out code.
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python src/cli.py
