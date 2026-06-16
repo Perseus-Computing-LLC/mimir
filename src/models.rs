@@ -32,6 +32,12 @@ pub struct Entity {
     pub verified: bool,
     #[serde(default = "default_source")]
     pub source: String,
+    #[serde(default)]
+    pub always_on: bool,
+    /// Certainty for typed entities (0.0-1.0). Used by mimir_conflicts:
+    /// low-certainty entities on the same topic are a conflict signal.
+    #[serde(default = "default_certainty")]
+    pub certainty: f64,
     pub created_at_unix_ms: i64,
     pub last_accessed_unix_ms: i64,
     #[serde(skip)]
@@ -76,6 +82,10 @@ fn default_layer() -> String {
 
 fn default_source() -> String {
     "agent".to_string()
+}
+
+fn default_certainty() -> f64 {
+    0.5
 }
 
 /// A link between two entities. Stored as JSON array in entities.links.
@@ -141,6 +151,19 @@ pub struct RecallParams {
     pub skip_side_effects: bool,
     pub mode: SearchMode,
     pub embedding: Option<Vec<f32>>,
+    /// If set, truncate body_json at this many chars and append drill-down footer.
+    /// BrainDB-inspired: prevents large bodies from silently flooding context.
+    pub preview_cap: Option<i64>,
+    /// If Some, only return entities where always_on matches (for context injection).
+    pub always_on: Option<bool>,
+    /// Additive boost weight for content witness signal (0.0 = disabled).
+    /// Computes substring-match score against body_json, damped by body length.
+    pub content_weight: f64,
+    /// Per-keyword halving quota for result diversity (1.0 = disabled).
+    /// Each distinct matched keyword gets ceil(max_results × halving^n) slots.
+    pub diversity_halving: f64,
+    /// Per-query reservation share for multi-query diversity (0.0 = disabled).
+    pub diversity_per_query_share: f64,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, or hybrid fusion.
@@ -194,6 +217,11 @@ impl Default for RecallParams {
             skip_side_effects: false,
             mode: SearchMode::Fts5,
             embedding: None,
+            preview_cap: None,
+            always_on: None,
+            content_weight: 0.0,
+            diversity_halving: 1.0,
+            diversity_per_query_share: 0.0,
         }
     }
 }

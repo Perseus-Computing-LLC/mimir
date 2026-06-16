@@ -198,7 +198,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         r###"[
   {
     "name": "mimir_remember",
-    "description": "Store or update an entity by (category, key). Idempotent \u2014 call as often as you want, same key returns an update. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
+    "description": "Store or update an entity by (category, key). Idempotent \u2014 call as often as you want, same key returns an update. Optional always_on=true injects entity into every mimir_context. Optional certainty (0.0-1.0) is used by mimir_conflicts for typed-entity conflict detection. Use this for saving facts, decisions, architecture notes, and conventions. When encryption is enabled, body_json is encrypted at rest with AES-256-GCM.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -336,6 +336,24 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
             }
           },
           "description": "Configuration for FTS5 query expansion using Porter stemming"
+        },
+        "preview_cap": {
+          "type": "integer",
+          "description": "If set, truncate body_json at N chars and append drill-down footer. Use mimir_get_entity to read full body."
+        },
+        "content_weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0,
+          "description": "Additive boost for content witness — rewards entities whose body text literally contains query terms. Damped by body length. Never penalizes."
+        },
+        "diversity_halving": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 1,
+          "description": "Per-keyword diversity quota factor (1.0=disabled). Each distinct matched keyword gets ceil(N x halving^n) slots — first keyword N, second N/2, etc."
         }
       },
       "required": [
@@ -411,6 +429,41 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false
+    }
+  },
+  {
+    "name": "mimir_get_entity",
+    "description": "Get an entity by ID with its full body_json content. Use after mimir_recall with preview_cap to read the complete body of a truncated result. The drill-down footer embedded in preview-capped results references this tool with the entity ID to use.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Entity ID to retrieve (from recall result id field or preview cap footer)"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "category": { "type": "string" },
+        "key": { "type": "string" },
+        "body_json": { "type": "string", "description": "Full entity body content" },
+        "status": { "type": "string" },
+        "entity_type": { "type": "string" },
+        "decay_score": { "type": "number" },
+        "retrieval_count": { "type": "integer" },
+        "layer": { "type": "string" },
+        "always_on": { "type": "boolean" },
+        "certainty": { "type": "number" }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
     }
   },
   {
@@ -1525,6 +1578,9 @@ fn call_tool(
             tools::handle_ask(db, args).map_err(|e| error_response(id, -32603, &e))
         }
 
+        "mimir_get_entity" => {
+            tools::handle_get_entity(db, args).map_err(|e| error_response(id, -32603, &e))
+        }
         "mimir_forget" => {
             tools::handle_forget(db, args).map_err(|e| error_response(id, -32603, &e))
         }

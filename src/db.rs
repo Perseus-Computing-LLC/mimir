@@ -222,6 +222,8 @@ impl Database {
                             tags: doc.tags,
                             decay_score: 1.0,
                             retrieval_count: 0,
+                            always_on: false,
+                            certainty: 0.5,
                             layer: "buffer".to_string(),
                             topic_path: String::new(),
                             archived: false,
@@ -691,8 +693,9 @@ impl Database {
                     decay_score = ?5, layer = ?6, topic_path = ?7,
                     archived = ?8, archive_reason = ?9, links = ?10,
                     verified = ?11, source = ?12, last_accessed_unix_ms = ?13,
+                    always_on = ?14, certainty = ?15,
                     retrieval_count = retrieval_count + 1
-                 WHERE id = ?14",
+                 WHERE id = ?16",
                 params![
                     body_encrypted,
                     entity.status,
@@ -707,6 +710,8 @@ impl Database {
                     verified_int,
                     entity.source,
                     now,
+                    entity.always_on as i32,
+                    entity.certainty,
                     id,
                 ],
             )?;
@@ -746,11 +751,11 @@ impl Database {
                  (id, category, key, body_json, status, type, tags,
                   decay_score, retrieval_count, layer, topic_path,
                   archived, archive_reason, links, verified, source,
-                  created_at_unix_ms, last_accessed_unix_ms)
+                  always_on, certainty, created_at_unix_ms, last_accessed_unix_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          ?8, ?9, ?10, ?11,
                          ?12, ?13, ?14, ?15, ?16,
-                         ?17, ?18)",
+                         ?17, ?18, ?19, ?20)",
                 params![
                     id,
                     entity.category,
@@ -768,6 +773,8 @@ impl Database {
                     links_json,
                     verified_int,
                     entity.source,
+                    entity.always_on as i32,
+                    entity.certainty,
                     entity.created_at_unix_ms,
                     entity.last_accessed_unix_ms,
                 ],
@@ -911,6 +918,15 @@ impl Database {
             }
         }
 
+        // Filter by always_on flag
+        if let Some(ao) = params.always_on {
+            conditions.push(format!(
+                "always_on = ?{}",
+                param_values.len() + 1
+            ));
+            param_values.push(Box::new(ao as i32));
+        }
+
         // Exclude archived unless explicitly requested
         if !params.include_archived {
             conditions.push("archived = 0".to_string());
@@ -954,7 +970,7 @@ impl Database {
 
         let mut items = Vec::new();
         for row in rows {
-            let entity = row?;
+            let mut entity = row?;
             // Update retrieval count, recency, decay boost, and layer
             if !params.skip_side_effects {
                 let new_count = entity.retrieval_count + 1;
@@ -967,10 +983,98 @@ impl Database {
                     params![new_count, now_ms(), boosted_decay, new_layer, entity.id],
                 );
             }
+
+            // #103: Apply preview cap with drill-down footer (BrainDB-inspired)
+            if let Some(cap) = params.preview_cap {
+                let cap = cap as usize;
+                if entity.body_json.len() > cap {
+                    let extra = entity.body_json.len() - cap;
+                    let truncated = entity.body_json[..cap].to_string();
+                    let footer = format!(
+                        "\n--truncated ({} more chars)-- full body: get_entity(\"{}\"). If large, delegate_to_subagent to read/extract it without polluting this context.",
+                        extra, entity.id
+                    );
+                    entity.body_json = format!("{}{}", truncated, footer);
+                    items.push(entity);
+                    continue;
+                }
+            }
             items.push(entity);
         }
 
+        // #106: Content witness signal (additive boost, never penalizes)
+        if params.content_weight > 0.0 && !params.query.is_empty() {
+            let query_lower = params.query.to_lowercase();
+            let size_pivot: f64 = 5000.0;
+            for entity in &mut items {
+                let body_lower = entity.body_json.to_lowercase();
+                if body_lower.contains(&query_lower) {
+                    let content_len = entity.body_json.len() as f64;
+                    let damper = 1.0 / (1.0 + (1.0 + content_len / size_pivot.max(1.0)).log10());
+                    // Boost decay_score as a proxy for ranking (additive, never penalizes)
+                    entity.decay_score = (entity.decay_score + params.content_weight * damper).min(1.0);
+                }
+            }
+            // Re-sort after content witness boost
+            items.sort_by(|a, b| b.decay_score.partial_cmp(&a.decay_score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // #105: Two-level diversity quota (BrainDB-inspired)
+        // Per-keyword halving: each distinct keyword gets ceil(max_results x halving^n) slots
+        if params.diversity_halving < 1.0 && params.diversity_halving > 0.0 && !items.is_empty() {
+            items = Self::apply_diversity_quota(items, params.limit as usize, params.diversity_halving, &params.query);
+        }
+
         Ok(items)
+    }
+
+    /// #105: Apply per-keyword halving diversity quota.
+    /// Each distinct matched keyword gets ceil(max_results x halving^n) slots,
+    /// preventing a single popular keyword from monopolizing results.
+    fn apply_diversity_quota(
+        mut items: Vec<Entity>,
+        max_results: usize,
+        halving: f64,
+        query: &str,
+    ) -> Vec<Entity> {
+        // Extract the dominant matched keyword for each entity
+        // (the first query word that appears in the entity body)
+        let query_words: Vec<&str> = query.split_whitespace().filter(|w| w.len() >= 3).collect();
+        let mut kw_slots: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut kw_order: Vec<String> = Vec::new();
+        let mut out: Vec<Entity> = Vec::new();
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for entity in items.drain(..) {
+            if out.len() >= max_results {
+                break;
+            }
+            if taken.contains(&entity.id) {
+                continue;
+            }
+
+            // Find dominant keyword: first query word found in body_json
+            let body_lower = entity.body_json.to_lowercase();
+            let dom_kw = query_words.iter().find(|w| body_lower.contains(&w.to_lowercase())).map(|w| w.to_string());
+
+            if let Some(ref kw) = dom_kw {
+                if !kw_slots.contains_key(kw) {
+                    let n = kw_slots.len();
+                    kw_slots.insert(kw.clone(), (max_results as f64 * halving.powi(n as i32)).ceil() as i64);
+                    kw_order.push(kw.clone());
+                }
+                let remaining = kw_slots.get_mut(kw).unwrap();
+                if *remaining <= 0 {
+                    continue; // This keyword's quota exhausted
+                }
+                *remaining -= 1;
+            }
+
+            taken.insert(entity.id.clone());
+            out.push(entity);
+        }
+
+        out
     }
 
     /// Get a single entity by category and key.
@@ -1622,6 +1726,9 @@ impl Database {
 
     /// Detect conflicting entities — entities in the same category with very different body_json.
     /// Returns pairs of entities with low trigram similarity (potential conflicts).
+    /// #107: Also factors in certainty — low-certainty entities on the same topic
+    /// amplify the conflict signal. Two entities with certainty < 0.4 on similar
+    /// topics are flagged even at higher similarity thresholds.
     pub fn detect_conflicts(
         &self,
         category: &str,
@@ -1630,7 +1737,7 @@ impl Database {
         offset: i64,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, key, body_json FROM entities WHERE category = ?1 AND archived = 0
+            "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
              ORDER BY last_accessed_unix_ms DESC LIMIT 200 OFFSET ?2"
         )?;
         let rows = stmt.query_map(params![category, offset], |r| {
@@ -1638,23 +1745,32 @@ impl Database {
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, f64>(3).unwrap_or(0.5),
             ))
         })?;
 
-        let entities: Vec<(String, String, String)> = rows.filter_map(|r| r.ok()).collect();
+        let entities: Vec<(String, String, String, f64)> = rows.filter_map(|r| r.ok()).collect();
         let mut conflicts = Vec::new();
 
         for i in 0..entities.len() {
             for j in (i + 1)..entities.len() {
-                let (ref id1, ref key1, ref body1) = entities[i];
-                let (ref id2, ref key2, ref body2) = entities[j];
+                let (ref id1, ref key1, ref body1, cert1) = entities[i];
+                let (ref id2, ref key2, ref body2, cert2) = entities[j];
                 let sim = Self::trigram_similarity(body1, body2);
-                if sim < threshold {
+                // #107: Certainty-adjusted threshold — low-certainty pairs need less trigram overlap to flag
+                let min_cert = cert1.min(cert2);
+                let adj_threshold = if min_cert < 0.4 {
+                    threshold * 1.5 // Relaxed threshold: catch more potential conflicts when certainty is low
+                } else {
+                    threshold
+                };
+                if sim < adj_threshold {
                     conflicts.push(serde_json::json!({
-                        "entity_a": {"id": id1, "key": key1},
-                        "entity_b": {"id": id2, "key": key2},
+                        "entity_a": {"id": id1, "key": key1, "certainty": cert1},
+                        "entity_b": {"id": id2, "key": key2, "certainty": cert2},
                         "similarity": sim,
-                        "conflict_likely": sim < 0.3
+                        "conflict_likely": sim < 0.3 || min_cert < 0.3,
+                        "certainty_boosted": min_cert < 0.4
                     }));
                     if conflicts.len() as i64 >= limit {
                         break;
@@ -1988,6 +2104,8 @@ last_accessed: {}
                 links: vec![],
                 verified: false,
                 source: "vault-import".to_string(),
+                always_on: false,
+                certainty: 0.5,
                 created_at_unix_ms: now_ms(),
                 last_accessed_unix_ms: now_ms(),
                 embedding: None,
@@ -2024,6 +2142,15 @@ last_accessed: {}
     ) -> Result<String, Box<dyn std::error::Error>> {
         let mut all_entities = Vec::new();
 
+        // #104: Always-on entities — injected unconditionally, before query results
+        let always_on_params = RecallParams {
+            always_on: Some(true),
+            limit: 50,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        };
+        let always_on_entities = self.recall(&always_on_params)?;
+
         if categories.is_empty() {
             // No filter — get top entities overall (read-only, no side effects)
             let params = RecallParams {
@@ -2047,6 +2174,23 @@ last_accessed: {}
 
         // Format as markdown
         let mut ctx = String::from("## Mimir Context\n\n");
+
+        // Always-on entities first, visually distinct
+        if !always_on_entities.is_empty() {
+            ctx.push_str("### Always On\n\n");
+            for entity in &always_on_entities {
+                ctx.push_str(&format!(
+                    "- [always-on] [{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
+                    entity.category,
+                    entity.key,
+                    truncate_str(&entity.body_json, 100),
+                    entity.retrieval_count,
+                    entity.decay_score,
+                ));
+            }
+            ctx.push_str("\n");
+        }
+
         for entity in &all_entities {
             ctx.push_str(&format!(
                 "- [{}] **{}** — {} (retrievals: {}, decay: {:.2})\n",
@@ -2057,7 +2201,7 @@ last_accessed: {}
                 entity.decay_score,
             ));
         }
-        ctx.push_str(&format!("\n> {} entities recalled\n", all_entities.len()));
+        ctx.push_str(&format!("\n> {} entities recalled\n", all_entities.len() + always_on_entities.len()));
 
         Ok(ctx)
     }
@@ -2360,6 +2504,8 @@ fn entity_from_row(
         links,
         verified: verified != 0,
         source: row.get(15)?,
+        always_on: row.get::<_, i32>(19).unwrap_or(0) != 0,
+        certainty: row.get::<_, f64>(20).unwrap_or(0.5),
         created_at_unix_ms: row.get(16)?,
         last_accessed_unix_ms: row.get(17)?,
         embedding: None,
@@ -2397,6 +2543,8 @@ mod tests {
             links: vec![],
             verified: false,
             source: "test".to_string(),
+            always_on: false,
+            certainty: 0.5,
             created_at_unix_ms: now_ms(),
             last_accessed_unix_ms: now_ms(),
             embedding: None,

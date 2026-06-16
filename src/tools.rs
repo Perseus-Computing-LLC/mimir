@@ -28,6 +28,14 @@ pub struct RememberArgs {
     pub topic_path: String,
     #[serde(default)]
     pub recall_when: Vec<String>,
+    #[serde(default)]
+    pub always_on: bool,
+    #[serde(default = "default_certainty")]
+    pub certainty: f64,
+}
+
+fn default_certainty() -> f64 {
+    0.5
 }
 
 fn default_status() -> String {
@@ -64,6 +72,18 @@ pub struct RecallArgs {
     pub expansion: crate::models::QueryExpansionConfig,
     #[serde(default)]
     pub mode: String, // "fts5", "dense", or "hybrid"
+    #[serde(default)]
+    pub preview_cap: Option<i64>,
+    #[serde(default)]
+    pub always_on: Option<bool>,
+    #[serde(default)]
+    pub content_weight: f64,
+    #[serde(default = "default_halving")]
+    pub diversity_halving: f64,
+}
+
+fn default_halving() -> f64 {
+    1.0
 }
 
 fn default_limit() -> i64 {
@@ -240,6 +260,8 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         links: vec![],
         verified: false,
         source: "agent".to_string(),
+        always_on: a.always_on,
+        certainty: a.certainty,
         created_at_unix_ms: now,
         last_accessed_unix_ms: now,
         embedding: None,
@@ -285,6 +307,11 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         skip_side_effects: false,
         mode,
         embedding: None,
+        preview_cap: a.preview_cap,
+        always_on: a.always_on,
+        content_weight: a.content_weight,
+        diversity_halving: a.diversity_halving,
+        diversity_per_query_share: 0.0,
     };
 
     let entities = db
@@ -343,6 +370,11 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             skip_side_effects: false,
             mode: SearchMode::Fts5,
             embedding: None,
+            preview_cap: a.preview_cap,
+            always_on: a.always_on,
+            content_weight: a.content_weight,
+            diversity_halving: a.diversity_halving,
+            diversity_per_query_share: 0.0,
         };
 
         if let Ok(entities) = db.recall(&params) {
@@ -374,6 +406,38 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
         "items": items_expanded,
         "total": items_expanded.len(),
         "variants": variants.len(),
+    });
+    Ok(result.to_string())
+}
+
+
+/// #103: Get a single entity by ID with full body (for drill-down after preview cap).
+pub fn handle_get_entity(db: &Database, args: Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing 'id' parameter".to_string())?;
+
+    let entity = db
+        .get_entity_by_id_public(id)
+        .map_err(|e| format!("Get entity failed: {}", e))?
+        .ok_or_else(|| format!("Entity not found: {}", id))?;
+
+    let result = json!({
+        "id": entity.id,
+        "category": entity.category,
+        "key": entity.key,
+        "body_json": entity.body_json,
+        "status": entity.status,
+        "entity_type": entity.entity_type,
+        "tags": entity.tags,
+        "decay_score": entity.decay_score,
+        "retrieval_count": entity.retrieval_count,
+        "layer": entity.layer,
+        "always_on": entity.always_on,
+        "certainty": entity.certainty,
+        "created_at_unix_ms": entity.created_at_unix_ms,
+        "last_accessed_unix_ms": entity.last_accessed_unix_ms,
     });
     Ok(result.to_string())
 }
