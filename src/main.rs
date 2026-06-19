@@ -178,6 +178,25 @@ fn default_db_path() -> String {
     })
 }
 
+/// Check for a legacy database at ~/mimir.db and warn if the default path
+/// would create a new empty database instead.
+fn check_legacy_db(db_path: &str) {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/root".to_string());
+    let legacy = std::path::PathBuf::from(format!("{}/mimir.db", home));
+    let target = std::path::PathBuf::from(db_path);
+    if legacy.exists() && !target.exists() {
+        eprintln!("mimir: ⚠  Legacy database found at {}", legacy.display());
+        eprintln!("mimir:    The default database path is now {}", target.display());
+        eprintln!("mimir:    To use the legacy database, either:");
+        eprintln!("mimir:      - Set MIMIR_DB_PATH={}", legacy.display());
+        eprintln!("mimir:      - Pass --db {}", legacy.display());
+        eprintln!("mimir:      - Move it: mv {} {}", legacy.display(), target.display());
+        eprintln!("mimir:    Starting with a new empty database at {}.", target.display());
+    }
+}
+
 fn default_key_file() -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -273,6 +292,8 @@ fn main() {
             ..
         }) => {
             let db_path = db.clone();
+            check_legacy_db(&db_path);
+            eprintln!("mimir: using database at {}", db_path);
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
                 Err(e) => {
