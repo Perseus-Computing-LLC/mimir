@@ -460,7 +460,7 @@ fn main() {
             ref llm_api_key,
             ref embedding_endpoint,
             ref llm_model,
-            embedding_model: _,
+            embedding_model: ref embedding_model_path,
             ref connectors_config,
             ref web_auth_token,
             ref transport,
@@ -498,6 +498,12 @@ fn main() {
                     "mimir: LLM enabled (endpoint: {}, model: {})",
                     endpoint, llm_model
                 );
+            }
+
+            // Configure local ONNX embeddings if --embedding-model is set
+            if let Some(ref model_path) = embedding_model_path {
+                database.set_embedding_model(model_path);
+                eprintln!("mimir: local ONNX embedding enabled (model: {})", model_path);
             }
 
             // Load connectors from YAML config if provided

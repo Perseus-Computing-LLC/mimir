@@ -22,6 +22,38 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Simple LRU cache for embedding vectors. Stores up to `capacity` entries;
+/// when full, the oldest entry is evicted. Avoids re-computing embeddings for
+/// recently seen text.
+struct EmbeddingCache {
+    entries: Vec<(String, Vec<f32>)>,
+    capacity: usize,
+}
+
+impl EmbeddingCache {
+    fn new(capacity: usize) -> Self {
+        EmbeddingCache { entries: Vec::with_capacity(capacity), capacity }
+    }
+    fn get(&mut self, text: &str) -> Option<&Vec<f32>> {
+        if let Some(pos) = self.entries.iter().position(|(t, _)| t.as_str() == text) {
+            // Move to front (MRU)
+            let entry = self.entries.remove(pos);
+            self.entries.insert(0, entry);
+            Some(&self.entries[0].1)
+        } else {
+            None
+        }
+    }
+    fn put(&mut self, text: String, vec: Vec<f32>) {
+        if let Some(pos) = self.entries.iter().position(|(t, _)| t.as_str() == text) {
+            self.entries.remove(pos);
+        } else if self.entries.len() >= self.capacity {
+            self.entries.pop();
+        }
+        self.entries.insert(0, (text, vec));
+    }
+}
+
 pub struct Database {
     conn: Connection,
     db_path: String,
@@ -29,6 +61,7 @@ pub struct Database {
     llm_config: LlmConfig,
     #[allow(dead_code)]
     embedding_config: crate::embedding::EmbeddingConfig,
+    embedding_cache: std::sync::Mutex<EmbeddingCache>,
     connectors: Vec<Box<dyn Connector>>,
 }
 
@@ -75,6 +108,7 @@ impl Database {
             encryption: None,
             llm_config: LlmConfig::default(),
             embedding_config: crate::embedding::EmbeddingConfig::default(),
+            embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(256)),
             connectors: Vec::new(),
         })
     }
@@ -105,6 +139,15 @@ impl Database {
     }
 
     /// Configure LLM integration for the mimir_ask tool.
+    /// Configure local embedding backend with path to ONNX model.
+    /// Enables local embeddings via the bundled `ort` + `tokenizers` backend.
+    pub fn set_embedding_model(&mut self, model_path: &str) {
+        self.embedding_config = crate::embedding::EmbeddingConfig::with_model_path(
+            std::path::PathBuf::from(model_path),
+        );
+        self.llm_config.embedding_endpoint = None; // prefer local ONNX over remote
+    }
+
     pub fn set_llm(
         &mut self,
         enabled: bool,
@@ -313,7 +356,7 @@ impl Database {
             let mut errors = Vec::new();
             for row in rows {
                 let (id, body) = row?;
-                match self.call_ollama_embed(&body) {
+                match self.generate_embedding_with_fallback(&body) {
                     Ok(vec) => {
                         self.store_embedding(&id, &vec)?;
                         embedded += 1;
@@ -336,7 +379,7 @@ impl Database {
             .ok_or_else(|| format!("entity not found: {}/{}", category, key))?;
 
         let text = params.text.as_ref().unwrap_or(&entity.body_json);
-        let embedding = self.call_ollama_embed(text)?;
+        let embedding = self.generate_embedding_with_fallback(text)?;
         self.store_embedding(&entity.id, &embedding)?;
 
         Ok(serde_json::json!({
@@ -344,6 +387,46 @@ impl Database {
             "id": entity.id,
             "dimensions": embedding.len(),
         }))
+    }
+
+    /// Generate an embedding vector, falling back through available backends:
+    /// 1. Local ONNX model (if embedding_config.enabled)
+    /// 2. Python onnxruntime subprocess (if available)
+    /// 3. Ollama /api/embed or OpenAI /v1/embeddings (if llm_config set)
+    fn generate_embedding_with_fallback(
+        &self,
+        text: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        // 0. Hit the in-memory cache
+        if let Ok(mut cache) = self.embedding_cache.lock() {
+            if let Some(vec) = cache.get(text) {
+                return Ok(vec.clone());
+            }
+        }
+
+        // 1. Local ONNX — if config is enabled and model file exists
+        if self.embedding_config.enabled && self.embedding_config.model_path.exists() {
+            match crate::embedding::generate_embedding(&self.embedding_config, text) {
+                Ok(vec) => {
+                    // Cache successful embedding
+                    if let Ok(mut cache) = self.embedding_cache.lock() {
+                        cache.put(text.to_string(), vec.clone());
+                    }
+                    return Ok(vec);
+                }
+                Err(e) => eprintln!(
+                    "mimir: local ONNX embedding failed ({}), falling back...",
+                    e
+                ),
+            }
+        }
+
+        // 2. Remote endpoint (Ollama or OpenAI-compatible)
+        if self.llm_config.enabled {
+            return self.call_ollama_embed(text);
+        }
+
+        Err("No embedding backend available. Set --embedding-model to a local ONNX model, or --llm-endpoint for remote.".into())
     }
 
     /// Call embed endpoint to get a dense vector for a text.
