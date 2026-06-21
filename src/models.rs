@@ -466,6 +466,9 @@ pub struct PruneParams {
     pub limit: usize,
     #[serde(default)]
     pub dry_run: bool,
+    /// Explicitly archive everything in the category (no threshold required).
+    #[serde(default)]
+    pub purge_all: bool,
 }
 
 fn default_prune_limit() -> usize {
