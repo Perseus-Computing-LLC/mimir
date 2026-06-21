@@ -90,6 +90,13 @@ struct Cli {
     /// routes accept this token as workspace authentication.
     #[arg(long)]
     workspace_token: Option<String>,
+
+    /// Enable offline / air-gapped mode. Disables the web dashboard, LLM endpoint,
+    /// embedding endpoint, and external connectors. All core tools (remember, recall,
+    /// search, journal, encryption) continue to function with zero network calls.
+    /// NIST SP 800-53 SC-7 / DoD IL5+ / ICD 503 air-gapped environment support.
+    #[arg(long, default_value_t = false, hide = true)]
+    offline: bool,
 }
 
 #[derive(Subcommand)]
@@ -203,6 +210,11 @@ enum Commands {
         /// Token required for cross-workspace access (v1.2.0)
         #[arg(long)]
         workspace_token: Option<String>,
+
+        /// Enable offline / air-gapped mode. Disables web dashboard, LLM,
+        /// embedding, and connectors. NIST SP 800-53 SC-7 / DoD IL5+ support.
+        #[arg(long, default_value_t = false, hide = true)]
+        offline: bool,
     },
 
     /// Migrate a v0.1.x Mimir database to v0.2.0 schema
@@ -577,6 +589,19 @@ fn main() {
             let db_path = db.clone();
             check_legacy_db(&db_path);
             eprintln!("mimir: using database at {}", db_path);
+
+            // Offline mode: disable network-dependent features
+            let offline = cli.offline;
+            let effective_web = if offline { false } else { *web };
+            let effective_llm = if offline { None } else { llm_endpoint.as_deref() };
+            let effective_embedding = if offline { None } else { embedding_endpoint.as_deref() };
+            let effective_connectors = if offline { None } else { connectors_config.as_deref() };
+
+            if offline {
+                eprintln!("mimir: running in offline / air-gapped mode");
+                eprintln!("mimir: web dashboard, LLM, embedding, and connectors disabled");
+            }
+
             let mut database = match db::Database::open(&db_path) {
                 Ok(db) => db,
                 Err(e) => {
@@ -593,13 +618,13 @@ fn main() {
             }
 
             // Configure LLM for mimir_ask if endpoint is provided
-            if let Some(ref endpoint) = llm_endpoint {
+            if let Some(ref endpoint) = effective_llm {
                 database.set_llm(
                     true,
                     endpoint,
                     llm_model,
                     llm_api_key.as_deref(),
-                    embedding_endpoint.as_deref(),
+                    effective_embedding,
                 );
                 eprintln!(
                     "mimir: LLM enabled (endpoint: {}, model: {})",
@@ -614,7 +639,7 @@ fn main() {
             }
 
             // Load connectors from YAML config if provided
-            if let Some(ref config_path) = connectors_config {
+            if let Some(ref config_path) = effective_connectors {
                 match load_connectors(config_path) {
                     Ok(connectors) => {
                         let count = connectors.len();
@@ -629,7 +654,7 @@ fn main() {
             }
 
             // Start web dashboard in background if requested
-            if *web {
+            if effective_web {
                 let web_port = *port;
                 let web_bind_addr = web_bind.clone();
                 let web_key = encryption_key.clone();
