@@ -2,5 +2,24 @@
   "$schema": "https://glama.ai/mcp/schemas/server.json",
   "maintainers": [
     "tcconnally"
+  ],
+  "tools": 36,
+  "transport": {
+    "stdio": true,
+    "sse": true,
+    "http": true
+  },
+  "features": [
+    "hybrid-search",
+    "encryption-at-rest",
+    "entity-lifecycle",
+    "graph-relationships",
+    "journal-audit-trail",
+    "state-management",
+    "vault-export-import",
+    "federation",
+    "rag",
+    "embedding-generation",
+    "web-dashboard"
   ]
 }

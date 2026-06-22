@@ -11,7 +11,7 @@ startCommand:
   commandFunction: |-
     (config) => ({
       command: 'mimir',
-      args: ['--db', config.dbPath || '~/.mimir/data/mimir.db']
+      args: ['serve', '--db', config.dbPath || '~/.mimir/data/mimir.db']
     })
   exampleConfig:
     dbPath: ~/.mimir/data/mimir.db

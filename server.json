@@ -2,13 +2,14 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/mimir",
   "title": "Mimir — Persistent Memory Engine for AI Agents",
-  "description": "Lightweight Rust MCP server providing persistent memory for AI agents. SQLite + FTS5 keyword search, Ebbinghaus decay, knowledge graph with entity linking, journal audit trails, state management with TTL, vault import/export, and conflict detection. Zero network calls, no API keys, no embeddings model required. 30 tools over stdio JSON-RPC 2.0, with optional SSE/HTTP transport and Bearer-token auth. Runs alongside your workspace — your agent remembers across sessions.",
-  "version": "1.0.1",
+  "description": "MCP-native, local-first persistent memory for AI agents. Rust binary with SQLite+FTS5+hybrid vector search, Ebbinghaus decay, knowledge graph, journal audit trail, state management with TTL, AES-256-GCM encryption, vault import/export, and conflict detection. Zero network calls, no API keys required. 36 MCP tools over stdio/SSE/HTTP. Install: curl -sSf https://get.mimir.perseus.observer | sh",
+  "version": "2.0.0",
   "packages": [{
-    "registryType": "crates.io",
-    "identifier": "mimir",
-    "version": "1.0.1",
+    "registryType": "github",
+    "identifier": "Perseus-Computing-LLC/mimir",
+    "version": "2.0.0",
     "packageArguments": [
+      {"type": "positional", "value": "serve"},
       {"type": "positional", "value": "--db"},
       {"type": "positional", "value": "~/.mimir/data/mimir.db"}
     ],
