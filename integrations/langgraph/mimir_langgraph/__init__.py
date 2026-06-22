@@ -96,7 +96,7 @@ class MimirStore(BaseStore):
         if self._proc is not None and self._proc.poll() is None:
             return
 
-        args = [self.binary, "--db", self.db_path]
+        args = [self.binary, "serve", "--db", self.db_path]
         if self.encryption_key:
             args.extend(["--encryption-key", self.encryption_key])
         # ollama_url maps to Mimir's --llm-endpoint (there is no --ollama-url flag).
@@ -117,8 +117,10 @@ class MimirStore(BaseStore):
         self._req_id = 0
 
         # Send initialize
+        init_id = self._req_id + 1
+        self._req_id = init_id
         init_req = json.dumps({
-            "jsonrpc": "2.0", "id": 1,
+            "jsonrpc": "2.0", "id": init_id,
             "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
@@ -132,6 +134,9 @@ class MimirStore(BaseStore):
         except (BrokenPipeError, OSError):
             self._proc = None
             raise RuntimeError("Failed to initialize mimir process")
+
+        # Read the initialize response
+        self._read_response(init_id)
 
     def _read_response(self, expect_id: int) -> Optional[dict]:
         """Read a single JSON-RPC response matching *expect_id*."""
@@ -217,9 +222,7 @@ class MimirStore(BaseStore):
             except RuntimeError as e:
                 raise RuntimeError(f"Mimir session failed: {e}")
 
-            # Read and discard the initialize response (first call only)
-            if self._req_id == 1:
-                self._read_response(1)
+            # No init response to consume — _ensure_session already read it
 
             req_id = self._req_id + 2
             call_req = json.dumps({

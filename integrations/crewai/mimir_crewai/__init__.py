@@ -76,7 +76,7 @@ class MimirMemoryTool(BaseTool):
         if self._proc is not None and self._proc.poll() is None:
             return  # already alive
 
-        args = [self.binary, "--db", self.db_path]
+        args = [self.binary, "serve", "--db", self.db_path]
         if self.encryption_key:
             args.extend(["--encryption-key", self.encryption_key])
 
