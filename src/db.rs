@@ -774,7 +774,7 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility
              FROM entities WHERE id IN ({})",
             placeholders
@@ -1402,7 +1402,7 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility
              FROM entities",
         );
@@ -1602,7 +1602,7 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility
              FROM entities WHERE category = ?1 AND key = ?2 LIMIT 1",
         )?;
@@ -2270,7 +2270,7 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility
              FROM entities WHERE id = ?1",
         )?;
@@ -2305,7 +2305,7 @@ impl Database {
             "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility
              FROM entities WHERE archived = 0",
         );
@@ -3072,7 +3072,7 @@ last_accessed: {}
         let sql = "SELECT id, category, key, body_json, status, type, tags,
                     decay_score, retrieval_count, layer, topic_path,
                     archived, archive_reason, links, verified, source,
-                    created_at_unix_ms, last_accessed_unix_ms, embedding,
+                    created_at_unix_ms, last_accessed_unix_ms, NULL as embedding,
                     always_on, certainty, workspace_hash, agent_id, visibility
              FROM entities
              WHERE archived = 0
