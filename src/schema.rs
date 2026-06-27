@@ -30,7 +30,17 @@ CREATE TABLE IF NOT EXISTS entities (
     certainty REAL DEFAULT 0.5,
     workspace_hash TEXT DEFAULT '',
     agent_id TEXT DEFAULT '',
-    visibility TEXT DEFAULT 'workspace'
+    visibility TEXT DEFAULT 'workspace',
+    -- Bi-temporal facts (v2.4.0). Two time axes plus a supersession link, so a
+    -- fact can be retired without deleting history. All NULL/'' here means
+    -- \"valid since creation, currently true, never superseded\" — the behavior
+    -- before bi-temporal support, so existing rows need no interpretation change.
+    valid_from_unix_ms INTEGER,      -- when the fact became true in the world (NULL = since creation)
+    valid_to_unix_ms INTEGER,        -- when it stopped being true (NULL = still true)
+    recorded_at_unix_ms INTEGER,     -- transaction time: when Mimir first knew it (backfilled = created_at)
+    invalidated_at_unix_ms INTEGER,  -- transaction time: when Mimir retired it (NULL = live)
+    supersedes TEXT DEFAULT '',      -- id of the entity this one replaced
+    superseded_by TEXT DEFAULT ''    -- id of the entity that replaced this one
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_category_key ON entities(category, key);
@@ -73,7 +83,7 @@ CREATE TABLE IF NOT EXISTS state (
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -145,6 +155,42 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Er
     if !has_visibility {
         conn.execute_batch("ALTER TABLE entities ADD COLUMN visibility TEXT DEFAULT 'workspace';")?;
     }
+
+    // Add bi-temporal columns (v2.4.0 — bi-temporal facts). Valid time
+    // (valid_from/valid_to), transaction time (recorded_at/invalidated_at), and
+    // supersession links. All additive; existing rows keep their meaning.
+    if conn.prepare("SELECT valid_from_unix_ms FROM entities LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN valid_from_unix_ms INTEGER;")?;
+    }
+    if conn.prepare("SELECT valid_to_unix_ms FROM entities LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN valid_to_unix_ms INTEGER;")?;
+    }
+    if conn.prepare("SELECT recorded_at_unix_ms FROM entities LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN recorded_at_unix_ms INTEGER;")?;
+    }
+    if conn.prepare("SELECT invalidated_at_unix_ms FROM entities LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN invalidated_at_unix_ms INTEGER;")?;
+    }
+    if conn.prepare("SELECT supersedes FROM entities LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN supersedes TEXT DEFAULT '';")?;
+    }
+    if conn.prepare("SELECT superseded_by FROM entities LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN superseded_by TEXT DEFAULT '';")?;
+    }
+    // Backfill transaction time for pre-existing rows: a fact's recorded_at is
+    // when Mimir first stored it, i.e. its created_at. (No-op on a fresh DB.)
+    conn.execute_batch(
+        "UPDATE entities SET recorded_at_unix_ms = created_at_unix_ms \
+         WHERE recorded_at_unix_ms IS NULL;",
+    )?;
+
+    // Live-fact filter index. Created here (not in the ungated DDL) because it
+    // references invalidated_at_unix_ms, which on a migrating DB only exists
+    // after the ALTER above. NULL = live; recall will exclude non-NULL rows.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_entities_invalidated \
+         ON entities(invalidated_at_unix_ms);",
+    )?;
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -486,6 +532,85 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn adds_bitemporal_columns_and_backfills_recorded_at() {
+        // A legacy DB (no bi-temporal columns) with one row predating the migration.
+        let (conn, _path) = temp_db();
+        conn.execute_batch(
+            "CREATE TABLE entities (
+                id TEXT PRIMARY KEY, category TEXT NOT NULL DEFAULT 'general', key TEXT NOT NULL,
+                body_json TEXT NOT NULL DEFAULT '{}', archived INTEGER DEFAULT 0,
+                retrieval_count INTEGER DEFAULT 0,
+                created_at_unix_ms INTEGER NOT NULL, last_accessed_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE journal (
+                id TEXT PRIMARY KEY, entity_id TEXT DEFAULT '',
+                created_at_unix_ms INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, created_at_unix_ms, last_accessed_unix_ms)
+             VALUES ('e1', 'general', 'k', '{}', 111, 222)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT recorded_at_unix_ms FROM entities LIMIT 1").is_err(),
+            "precondition: legacy table lacks the bi-temporal columns"
+        );
+
+        initialize_schema(&conn).expect("migrate legacy db to bi-temporal schema");
+
+        // All six bi-temporal columns must now exist.
+        for col in [
+            "valid_from_unix_ms",
+            "valid_to_unix_ms",
+            "recorded_at_unix_ms",
+            "invalidated_at_unix_ms",
+            "supersedes",
+            "superseded_by",
+        ] {
+            assert!(
+                conn.prepare(&format!("SELECT {col} FROM entities LIMIT 1")).is_ok(),
+                "column {col} must be added during migration"
+            );
+        }
+
+        // recorded_at backfilled to created_at; the row is live (not invalidated)
+        // and unbounded in valid time — i.e. unchanged in meaning.
+        let recorded: i64 = conn
+            .query_row("SELECT recorded_at_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, 111, "recorded_at must backfill to created_at");
+        let invalidated: Option<i64> = conn
+            .query_row("SELECT invalidated_at_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(invalidated, None, "existing rows must be live (not invalidated)");
+        let valid_from: Option<i64> = conn
+            .query_row("SELECT valid_from_unix_ms FROM entities WHERE id='e1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(valid_from, None, "existing rows must be valid since creation");
+
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn fresh_db_has_bitemporal_columns_and_live_index() {
+        let (conn, _path) = temp_db();
+        initialize_schema(&conn).expect("init schema");
+        assert!(conn.prepare("SELECT invalidated_at_unix_ms FROM entities LIMIT 1").is_ok());
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_entities_invalidated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_entities_invalidated should be created on a fresh DB");
     }
 
     #[test]
