@@ -27,10 +27,10 @@
       "mrr": 0.9479
     },
     "hybrid": {
-      "recall@1": 0.2083,
-      "recall@3": 0.625,
-      "recall@5": 0.8333,
-      "mrr": 0.4379
+      "recall@1": 0.875,
+      "recall@3": 0.9583,
+      "recall@5": 0.9583,
+      "mrr": 0.9167
     }
   },
   "binary": "mimir.exe",
@@ -41,14 +41,13 @@
     "embedded": 24,
     "dimensions": null
   },
-  "signature_sha256": "95544cb66772841d363fbe6f7502457c7ace89d8d03c02702606e35ec20421e0",
+  "signature_sha256": "d78c724090062fffa0ed91b243dfb0938fbdd9fdb0705ad5f16c044bd4f500f5",
   "signature_covers": [
     "fts5",
-    "dense"
-  ],
-  "nondeterministic_modes": [
+    "dense",
     "hybrid"
   ],
+  "nondeterministic_modes": [],
   "per_query": [
     {
       "q": "what hot beverage does the user have each day",
@@ -84,16 +83,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "exercise",
-            "diet",
             "coffee",
-            "pet"
+            "exercise",
+            "cooking",
+            "commute",
+            "dentist"
           ],
-          "recall@1": 0.0,
-          "recall@3": 0.0,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.25
+          "rr": 1.0
         }
       }
     },
@@ -131,16 +130,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "exercise",
-            "phone",
             "job",
-            "plant"
+            "coffee",
+            "learning",
+            "security",
+            "phone"
           ],
-          "recall@1": 1.0,
-          "recall@3": 1.0,
-          "recall@5": 1.0,
-          "rr": 1.0
+          "recall@1": 0.0,
+          "recall@3": 0.0,
+          "recall@5": 0.0,
+          "rr": 0.16666666666666666
         }
       }
     },
@@ -178,16 +177,16 @@
         },
         "hybrid": {
           "top": [
-            "music",
-            "commute",
             "lang",
-            "exercise",
-            "learning"
+            "learning",
+            "music",
+            "sister",
+            "cooking"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -225,16 +224,16 @@
         },
         "hybrid": {
           "top": [
-            "diet",
-            "music",
             "pet",
-            "commute",
-            "exercise"
+            "diet",
+            "allergy",
+            "plant",
+            "music"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -272,16 +271,16 @@
         },
         "hybrid": {
           "top": [
+            "allergy",
             "diet",
-            "exercise",
-            "security",
-            "dentist",
-            "commute"
+            "coffee",
+            "cooking",
+            "fear"
           ],
-          "recall@1": 0.0,
-          "recall@3": 0.0,
-          "recall@5": 0.0,
-          "rr": 0.16666666666666666
+          "recall@1": 1.0,
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "rr": 1.0
         }
       }
     },
@@ -319,16 +318,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "deadline",
             "anniversary",
-            "exercise",
-            "dentist"
+            "dentist",
+            "deadline",
+            "commute",
+            "phone"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -366,16 +365,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
             "exercise",
+            "commute",
+            "coffee",
             "phone",
-            "plant",
-            "music"
+            "security"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.5
+          "rr": 1.0
         }
       }
     },
@@ -413,16 +412,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "deadline",
             "book",
+            "phone",
+            "cooking",
             "lang",
-            "dentist"
+            "deadline"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -460,16 +459,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "music",
             "car",
-            "exercise",
-            "lang"
+            "commute",
+            "lang",
+            "job",
+            "phone"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -507,16 +506,16 @@
         },
         "hybrid": {
           "top": [
-            "team",
-            "music",
             "sister",
-            "commute",
-            "exercise"
+            "pet",
+            "team",
+            "childhood",
+            "plant"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -554,16 +553,16 @@
         },
         "hybrid": {
           "top": [
+            "job",
             "commute",
-            "music",
+            "security",
             "lang",
-            "team",
-            "dentist"
+            "team"
           ],
-          "recall@1": 0.0,
-          "recall@3": 0.0,
-          "recall@5": 0.0,
-          "rr": 0.16666666666666666
+          "recall@1": 1.0,
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "rr": 1.0
         }
       }
     },
@@ -602,10 +601,10 @@
         "hybrid": {
           "top": [
             "music",
-            "commute",
-            "exercise",
             "plant",
-            "learning"
+            "learning",
+            "phone",
+            "security"
           ],
           "recall@1": 1.0,
           "recall@3": 1.0,
@@ -649,10 +648,10 @@
         "hybrid": {
           "top": [
             "diet",
+            "allergy",
             "music",
-            "exercise",
-            "commute",
-            "allergy"
+            "cooking",
+            "coffee"
           ],
           "recall@1": 1.0,
           "recall@3": 1.0,
@@ -695,16 +694,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "exercise",
+            "travel",
             "phone",
-            "diet",
-            "childhood"
+            "learning",
+            "commute",
+            "sister"
           ],
-          "recall@1": 0.0,
-          "recall@3": 0.0,
-          "recall@5": 0.0,
-          "rr": 0.16666666666666666
+          "recall@1": 1.0,
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "rr": 1.0
         }
       }
     },
@@ -742,16 +741,16 @@
         },
         "hybrid": {
           "top": [
+            "phone",
+            "learning",
             "commute",
-            "music",
-            "fear",
-            "team",
-            "phone"
+            "security",
+            "fear"
           ],
-          "recall@1": 0.0,
-          "recall@3": 0.0,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.2
+          "rr": 1.0
         }
       }
     },
@@ -790,10 +789,10 @@
         "hybrid": {
           "top": [
             "deadline",
-            "commute",
-            "exercise",
             "anniversary",
-            "music"
+            "dentist",
+            "job",
+            "cooking"
           ],
           "recall@1": 1.0,
           "recall@3": 1.0,
@@ -836,16 +835,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "team",
-            "diet",
             "security",
-            "phone"
+            "phone",
+            "learning",
+            "coffee",
+            "team"
           ],
-          "recall@1": 0.0,
-          "recall@3": 0.0,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.25
+          "rr": 1.0
         }
       }
     },
@@ -883,16 +882,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
-            "diet",
-            "dentist",
             "plant",
-            "exercise"
+            "allergy",
+            "phone",
+            "coffee",
+            "dentist"
           ],
-          "recall@1": 0.0,
-          "recall@3": 0.0,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.25
+          "rr": 1.0
         }
       }
     },
@@ -930,16 +929,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
             "diet",
+            "phone",
+            "childhood",
             "team",
-            "deadline",
-            "phone"
+            "travel"
           ],
           "recall@1": 0.0,
-          "recall@3": 0.0,
-          "recall@5": 0.0,
-          "rr": 0.14285714285714285
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "rr": 0.3333333333333333
         }
       }
     },
@@ -978,10 +977,10 @@
         "hybrid": {
           "top": [
             "team",
-            "exercise",
-            "deadline",
-            "commute",
-            "security"
+            "security",
+            "sister",
+            "learning",
+            "phone"
           ],
           "recall@1": 1.0,
           "recall@3": 1.0,
@@ -1024,16 +1023,16 @@
         },
         "hybrid": {
           "top": [
-            "commute",
             "dentist",
-            "exercise",
-            "diet",
-            "anniversary"
+            "anniversary",
+            "commute",
+            "phone",
+            "coffee"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.5
+          "rr": 1.0
         }
       }
     },
@@ -1071,16 +1070,16 @@
         },
         "hybrid": {
           "top": [
+            "cooking",
             "commute",
             "exercise",
-            "cooking",
-            "diet",
-            "anniversary"
+            "dentist",
+            "diet"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -1118,16 +1117,16 @@
         },
         "hybrid": {
           "top": [
-            "diet",
-            "lang",
             "fear",
-            "music",
-            "dentist"
+            "allergy",
+            "lang",
+            "plant",
+            "diet"
           ],
-          "recall@1": 0.0,
+          "recall@1": 1.0,
           "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.3333333333333333
+          "rr": 1.0
         }
       }
     },
@@ -1165,16 +1164,16 @@
         },
         "hybrid": {
           "top": [
-            "music",
             "lang",
-            "diet",
             "learning",
-            "commute"
+            "travel",
+            "music",
+            "phone"
           ],
           "recall@1": 0.0,
-          "recall@3": 0.0,
+          "recall@3": 1.0,
           "recall@5": 1.0,
-          "rr": 0.25
+          "rr": 0.5
         }
       }
     }

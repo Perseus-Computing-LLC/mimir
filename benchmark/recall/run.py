@@ -164,12 +164,14 @@ def main():
         for key in agg[mode]:
             agg[mode][key] = round(agg[mode][key] / n, 4)
 
-    # Signature over the *reproducible* modes only. fts5 and dense are
-    # deterministic run-to-run; `hybrid` (RRF) is NOT — its tie ordering depends
-    # on wall-clock decay and on mimir_recall's access side-effects, so its
-    # recall@k drifts by ~1-2 queries between runs. We therefore exclude it from
-    # the pinned signature but still report its scores (advisory). See README.
-    NONDETERMINISTIC = {"hybrid"}
+    # Signature over the reproducible modes. All three modes are now
+    # deterministic run-to-run: fts5 and dense always were, and `hybrid` (RRF)
+    # was made byte-stable in #247 via a deterministic id tie-break in the fusion
+    # plus a read-only, BM25-ranked keyword arm that no longer depends on
+    # wall-clock decay or on mimir_recall's access side-effects. The set below is
+    # kept (empty) so a future non-reproducible mode can be excluded without
+    # reworking the harness. See README.
+    NONDETERMINISTIC = set()
     repro_modes = [m for m in args.modes if m not in NONDETERMINISTIC]
     sig_payload = json.dumps({
         "dataset": data.get("name"), "k": ks, "modes": repro_modes,

@@ -68,7 +68,7 @@ python benchmark/recall/run.py --dataset locomo_subset.json
 |---|---|---|---|---|
 | `fts5` (keyword) | 4.2% | 12.5% | 20.8% | 0.131 |
 | `dense` (bundled embeddings) | **91.7%** | **95.8%** | **100%** | **0.948** |
-| `hybrid` (RRF) † | 20.8% | 54.2% | 83.3% | 0.431 |
+| `hybrid` (RRF) | 87.5% | 95.8% | 95.8% | 0.917 |
 
 *Measured on `mimir.exe`, Windows 11, bundled int8 all-MiniLM-L6-v2. Your
 absolute numbers may differ slightly by platform/binary; the methodology and the
@@ -84,22 +84,31 @@ relative picture are the point.*
 - **This set is adversarial to keyword search by design.** A real corpus has
   some lexically-overlapping queries where `fts5` does fine; don't read 4.2% as
   Mimir's keyword quality in general — read it as "paraphrase needs semantics."
-- **† `hybrid` underperforms pure `dense` here, and is non-deterministic.**
-  Mimir's hybrid mode fuses keyword + dense via Reciprocal Rank Fusion. When the
-  keyword arm is near-useless (as on this paraphrase set), RRF *dilutes* the
-  strong dense ranking, dropping recall@1 from 92% to ~21%. Worse, hybrid's
-  ranking drifts ~1–2 queries run-to-run because its tie ordering depends on
-  wall-clock decay and on `mimir_recall`'s access side-effects. **`fts5` and
-  `dense` are byte-stable run-to-run; `hybrid` is not** — so the pinned
-  `signature_sha256` covers only the reproducible modes (`signature_covers`).
-  This is a real improvement target: query-relevance-aware RRF weighting (down-
-  weight the keyword arm when it has no strong hits) and a deterministic,
-  read-only benchmark recall path.
+- **`hybrid` now tracks `dense` on this set, after #247.** This benchmark
+  originally surfaced two real RRF bugs: hybrid recall@1 collapsed to ~21%
+  (versus dense's 92%), and hybrid drifted ~1–2 queries run-to-run. Both are
+  fixed:
+  - *Dilution.* The keyword arm previously matched natural-language queries on
+    stopwords ("the", "have", "does"), returned the whole corpus ordered by
+    *popularity*, and rank-based RRF gave that noise full weight — burying the
+    dense rank-1 hit. The hybrid keyword arm now drops stopwords, ranks by **BM25
+    relevance** instead of popularity, is **dropped entirely when it finds no
+    content match**, and is fused at a reduced (dense-primary) weight. Hybrid
+    recall@1 rises from ~21% to **87.5%**. The residual gap to pure dense is a
+    handful of queries where a lexical match is genuinely misleading (e.g.
+    *"foreign language"* matching the *programming-language* memory) — an
+    inherent fusion trade-off, not the old pathology.
+  - *Non-determinism.* RRF now breaks score ties by entity id (instead of falling
+    back to randomly-seeded hash-map iteration order), and the keyword arm is a
+    **read-only, BM25-ranked** sub-query that no longer depends on wall-clock
+    decay or `mimir_recall`'s access side-effects. **All three modes are now
+    byte-stable run-to-run**, so the pinned `signature_sha256` covers `hybrid`
+    too.
 
 ## Reproducibility
 
-`fts5` and `dense` metrics are deterministic for a given dataset + binary +
-platform; re-running yields an identical `signature_sha256` over those modes.
+All three modes (`fts5`, `dense`, `hybrid`) are deterministic for a given
+dataset + binary + platform; re-running yields an identical `signature_sha256`.
 Exact dense rankings can vary marginally across CPU architectures (ONNX
 floating-point), so treat the committed `report.json` as the reference for *this*
 platform; CI (Linux) is the canonical re-run when wired up.

@@ -1319,23 +1319,25 @@ impl Database {
                     return Ok(dense_results.into_iter().map(|(e, _)| e).collect());
                 }
 
-                // Hybrid: run FTS5 sparse search too, then fuse via RRF
-                let sparse = self.fts5_search(params)?;
-                let dense_scored: Vec<(Entity, f64)> = dense_results
-                    .into_iter()
-                    .collect();
-                let sparse_scored: Vec<(Entity, f64)> = sparse
-                    .into_iter()
-                    .map(|e| {
-                        let score = e.decay_score;
-                        (e, score)
-                    })
-                    .collect();
+                // Hybrid: fuse the dense vectors with a read-only, BM25-ranked,
+                // stopword-filtered keyword arm. The keyword arm is fused at a
+                // reduced weight (and dropped entirely when it finds nothing) so
+                // it cannot dilute a strong dense ranking (#247).
+                //
+                // Both arms and the fusion are read-only: like `Dense`, the
+                // semantic recall path issues no access-state writes, so repeated
+                // hybrid recalls are idempotent (#247). Nothing in dense/BM25
+                // ordering or the id tie-break depends on access state, so the
+                // result is byte-stable run-to-run.
+                let dense_scored = dense_results;
+                let sparse_scored = self.fts5_bm25_search(params)?;
+                let sparse_weight = crate::db::sparse_arm_weight(sparse_scored.len());
                 let fused = crate::db::reciprocal_rank_fusion(
                     &dense_scored,
                     &sparse_scored,
                     60.0,
                     params.limit as usize,
+                    sparse_weight,
                     params.recency_half_life_secs,
                     now_ms(),
                 );
@@ -1604,6 +1606,142 @@ impl Database {
         }
 
         Ok(items)
+    }
+
+    /// Read-only keyword search for the hybrid sparse arm, ranked by BM25
+    /// relevance instead of popularity (#247).
+    ///
+    /// `fts5_search` orders by `retrieval_count`/`last_accessed` and mutates
+    /// access state — both wrong for a hybrid sub-query:
+    ///   * popularity ordering is not a relevance signal, so a query that only
+    ///     matched stopwords returned the whole corpus in popularity order, which
+    ///     rank-based RRF then treated as full-confidence keyword hits;
+    ///   * the access-state mutation made each recall a write, so the sparse arm's
+    ///     popularity ordering (and thus hybrid's output) drifted run-to-run.
+    ///
+    /// This returns `(entity, relevance)` ordered by relevance (best first),
+    /// where `relevance = -bm25(...)` so higher is better (SQLite's `bm25()` is
+    /// more-negative-is-better). It issues no writes. Archived rows are not in the
+    /// FTS index, so this path never reaches them; hybrid over archived entities
+    /// simply has no keyword arm (dense-only), which is acceptable.
+    fn fts5_bm25_search(
+        &self,
+        params: &RecallParams,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        // Keep only content-bearing terms. A natural-language query ("what hot
+        // beverage does the user have each day") is mostly function words that
+        // match almost every memory; matching on them turns the keyword arm into
+        // popularity noise that dilutes the dense ranking under RRF (#247). We
+        // drop stopwords here (sparse arm only — the fts5 keyword mode is
+        // untouched) so the arm matches on meaning-bearing terms or not at all.
+        let words: Vec<&str> = params
+            .query
+            .split_whitespace()
+            .filter(|w| !w.is_empty() && !is_stopword(w))
+            .collect();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn()?;
+        let escape_fts = |s: &str| -> String { s.replace('"', "\"\"") };
+        let fts_query = words
+            .iter()
+            .map(|w| {
+                let escaped = escape_fts(w);
+                if escaped.is_empty() {
+                    "\"\"".to_string()
+                } else {
+                    format!("\"{}\"*", escaped)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let mut conditions: Vec<String> = vec!["e.archived = 0".to_string()];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        // ?1 is always the FTS MATCH expression.
+        param_values.push(Box::new(fts_query));
+
+        if let Some(ref cat) = params.category {
+            if !cat.is_empty() {
+                conditions.push(format!("e.category = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(cat.clone()));
+            }
+        }
+        if let Some(ref t) = params.entity_type {
+            if !t.is_empty() {
+                conditions.push(format!("e.type = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(t.clone()));
+            }
+        }
+        if params.min_decay > 0.0 {
+            conditions.push(format!("e.decay_score >= ?{}", param_values.len() + 1));
+            param_values.push(Box::new(params.min_decay));
+        }
+        if let Some(ref tp) = params.topic_path {
+            if !tp.is_empty() {
+                conditions.push(format!(
+                    "e.topic_path LIKE ?{} ESCAPE '\\'",
+                    param_values.len() + 1
+                ));
+                let escaped = tp
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                param_values.push(Box::new(format!("{}%", escaped)));
+            }
+        }
+        if let Some(ao) = params.always_on {
+            conditions.push(format!("e.always_on = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(ao as i32));
+        }
+        if let Some(ref ws) = params.workspace_hash {
+            conditions.push(format!("e.workspace_hash = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(ws.clone()));
+        }
+        if let Some(ref aid) = params.agent_id {
+            conditions.push(format!("e.agent_id = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(aid.clone()));
+        }
+
+        let safe_limit = params.limit.clamp(0, 1000);
+        let limit_idx = param_values.len() + 1;
+        param_values.push(Box::new(safe_limit));
+
+        // bm25(entities_fts) is the trailing column (index 24); the leading 24
+        // columns match `entity_from_row`'s expected layout exactly.
+        let sql = format!(
+            "SELECT e.id, e.category, e.key, e.body_json, e.status, e.type, e.tags,
+                    e.decay_score, e.retrieval_count, e.layer, e.topic_path,
+                    e.archived, e.archive_reason, e.links, e.verified, e.source,
+                    e.created_at_unix_ms, e.last_accessed_unix_ms, NULL as embedding,
+                    e.always_on, e.certainty, e.workspace_hash, e.agent_id, e.visibility,
+                    bm25(entities_fts) AS rank
+             FROM entities_fts
+             JOIN entities e ON e.rowid = entities_fts.rowid
+             WHERE entities_fts MATCH ?1 AND {conditions}
+             ORDER BY rank ASC
+             LIMIT ?{limit_idx}",
+            conditions = conditions.join(" AND "),
+        );
+
+        let enc = self.encryption.as_ref();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            let entity = entity_from_row(row, enc)?;
+            let bm25: f64 = row.get(24)?;
+            // Flip sign so higher = more relevant (BM25 is more-negative-is-better).
+            Ok((entity, -bm25))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// #105: Apply per-keyword halving diversity quota.
@@ -3686,8 +3824,38 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
+/// Fusion weight for the sparse (keyword) arm of hybrid recall (#247).
+///
+/// The dense arm is the trusted primary semantic signal; the keyword arm is
+/// fused at a reduced weight (`< 1.0`) so it *augments* dense recall rather than
+/// overriding it. Plain equal-weight RRF let a keyword rank-1 tie or beat a
+/// confident dense rank-1, so a keyword arm that matched only common terms could
+/// bury the correct semantic hit.
+///
+/// Relevance-awareness lives in how the arm is *built*, not in a post-hoc
+/// scalar: `fts5_bm25_search` drops stopwords and ranks by BM25 relevance
+/// instead of popularity, so a paraphrase query with no meaning-bearing overlap
+/// produces an empty arm (weight 0 here) instead of the whole corpus as noise.
+/// An arm that fires has matched real content terms and is fused at
+/// `SPARSE_ARM_WEIGHT`.
+pub(crate) fn sparse_arm_weight(n_hits: usize) -> f64 {
+    /// Keyword-arm weight relative to the dense arm (1.0). Kept below 1 so dense
+    /// stays the primary ranking and the keyword arm corroborates / adds lexical
+    /// recall rather than overriding a confident semantic hit.
+    const SPARSE_ARM_WEIGHT: f64 = 0.5;
+    if n_hits == 0 {
+        0.0
+    } else {
+        SPARSE_ARM_WEIGHT
+    }
+}
+
 /// Reciprocal Rank Fusion: combine dense and sparse result sets.
 /// k controls the rank penalty (higher k = less penalty for lower ranks).
+///
+/// The dense arm carries full weight; the sparse arm is scaled by `sparse_weight`
+/// (see `sparse_arm_weight`) so a weak/empty keyword arm cannot dilute a strong
+/// dense ranking (#247).
 ///
 /// When `recency_half_life_secs` is `Some(hl)` with `hl > 0` (#235), each fused
 /// score is multiplied by a time-decay factor `0.5^(age / hl)` based on the
@@ -3695,11 +3863,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 /// older but lexically-similar hits. `None` (or `hl <= 0`) leaves the pure
 /// relevance ranking untouched. Entities with an unset (`<= 0`)
 /// `created_at_unix_ms` are never penalized (factor 1.0).
+
 pub fn reciprocal_rank_fusion(
     dense_results: &[(crate::models::Entity, f64)],
     sparse_results: &[(crate::models::Entity, f64)],
     k: f64,
     limit: usize,
+    sparse_weight: f64,
     recency_half_life_secs: Option<f64>,
     now_ms: i64,
 ) -> Vec<(crate::models::Entity, f64)> {
@@ -3708,6 +3878,9 @@ pub fn reciprocal_rank_fusion(
     let mut scores: HashMap<String, f64> = HashMap::new();
     let mut entities: HashMap<String, crate::models::Entity> = HashMap::new();
 
+    // The dense arm always carries full weight; the sparse (keyword) arm is
+    // weighted by its relevance confidence so a weak/noisy arm cannot dilute a
+    // strong dense ranking (#247).
     for (rank, (entity, _)) in dense_results.iter().enumerate() {
         let rrf = 1.0 / (k + (rank + 1) as f64);
         *scores.entry(entity.id.clone()).or_insert(0.0) += rrf;
@@ -3717,7 +3890,7 @@ pub fn reciprocal_rank_fusion(
     }
 
     for (rank, (entity, _)) in sparse_results.iter().enumerate() {
-        let rrf = 1.0 / (k + (rank + 1) as f64);
+        let rrf = sparse_weight / (k + (rank + 1) as f64);
         *scores.entry(entity.id.clone()).or_insert(0.0) += rrf;
         entities
             .entry(entity.id.clone())
@@ -3745,9 +3918,40 @@ pub fn reciprocal_rank_fusion(
         })
         .collect();
 
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by fused score (desc), breaking ties by entity id (asc) so the
+    // ordering is fully deterministic run-to-run. Without an explicit tie-break,
+    // equal-score entities fell back to the (randomly-seeded) HashMap iteration
+    // order, making hybrid recall drift ~1-2 queries between identical runs
+    // (#247).
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.id.cmp(&b.0.id))
+    });
     fused.truncate(limit);
     fused
+}
+
+/// Common English function/question words stripped from the hybrid keyword arm
+/// before FTS matching (#247).
+///
+/// These appear in nearly every memory, so matching on them makes the keyword
+/// arm return the whole corpus as low-relevance noise. Removing them lets the
+/// sparse arm match on meaning-bearing terms (or match nothing, in which case it
+/// is dropped). This list intentionally covers only high-frequency English
+/// stopwords and interrogatives; it is used solely for the hybrid sparse arm and
+/// never alters what the `fts5` keyword mode matches.
+fn is_stopword(word: &str) -> bool {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "any", "are", "as", "at", "be", "been", "by", "can", "could", "did",
+        "do", "does", "each", "for", "from", "had", "has", "have", "he", "her", "his", "how", "i",
+        "in", "is", "it", "its", "many", "me", "much", "my", "of", "on", "or", "our", "she",
+        "some", "that", "the", "their", "them", "they", "this", "to", "user", "users",
+        "was", "we", "were", "what", "when", "where", "which", "who", "whom", "whose", "why",
+        "will", "with", "would", "you", "your",
+    ];
+    let lower = word.to_ascii_lowercase();
+    STOPWORDS.contains(&lower.as_str())
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -4850,7 +5054,7 @@ mod tests {
         let sparse_results = vec![(sparse_only, 1.0), (both, 0.9)];
 
         let fused =
-            crate::db::reciprocal_rank_fusion(&dense_results, &sparse_results, 60.0, 10, None, 0);
+            crate::db::reciprocal_rank_fusion(&dense_results, &sparse_results, 60.0, 10, 1.0, None, 0);
         let fused_ids: Vec<&str> = fused.iter().map(|(e, _)| e.id.as_str()).collect();
 
         assert!(
@@ -4886,7 +5090,7 @@ mod tests {
         let sparse: Vec<(Entity, f64)> = vec![];
 
         // Relevance-only (default): the older, more-relevant entity ranks first.
-        let baseline = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, None, now);
+        let baseline = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, None, now);
         assert_eq!(
             baseline[0].0.id, "old",
             "without recency, the top-relevance entity must win"
@@ -4896,7 +5100,7 @@ mod tests {
         // brand-new entity overtakes it.
         let hl = day_ms as f64 / 1000.0;
         let boosted =
-            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, Some(hl), now);
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(hl), now);
         assert_eq!(
             boosted[0].0.id, "fresh",
             "recency boost must promote the newer entity"
@@ -4904,7 +5108,7 @@ mod tests {
 
         // A non-positive half-life is treated as disabled (no-op) — same as None.
         let disabled =
-            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, Some(0.0), now);
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(0.0), now);
         assert_eq!(
             disabled[0].0.id, "old",
             "hl <= 0 must disable recency weighting"
@@ -4922,12 +5126,215 @@ mod tests {
         let dense = vec![(unset, 0.5)];
         let sparse: Vec<(Entity, f64)> = vec![];
 
-        let out = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, Some(1.0), now);
+        let out = crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 1.0, Some(1.0), now);
         let expected = 1.0 / (60.0 + 1.0); // rank-0 RRF, unscaled
         assert!(
             (out[0].1 - expected).abs() < 1e-12,
             "entity with unset created_at must not be recency-penalized"
         );
+    }
+
+    // ─── #247: relevance-aware, deterministic hybrid fusion ──────────────
+
+    #[test]
+    fn sparse_arm_weight_drops_empty_arm_and_subweights_a_firing_arm() {
+        // An empty keyword arm (e.g. a paraphrase query whose content terms
+        // matched nothing after stopword filtering) contributes nothing.
+        assert_eq!(crate::db::sparse_arm_weight(0), 0.0);
+        // A firing arm is fused below the dense arm's full weight (dense-primary),
+        // so the keyword arm augments rather than overrides the semantic ranking.
+        let w = crate::db::sparse_arm_weight(3);
+        assert!(w > 0.0 && w < 1.0, "a firing keyword arm must be sub-unity, got {w}");
+        // Weight depends only on whether the arm fired, not on how many hits.
+        assert_eq!(crate::db::sparse_arm_weight(1), crate::db::sparse_arm_weight(9));
+    }
+
+    #[test]
+    fn rrf_weak_sparse_arm_does_not_dilute_dense_ranking() {
+        // Regression for #247 issue 1: a confident dense rank-1 must survive
+        // fusion even when the keyword arm ranks a different entity first. With
+        // the sparse arm dropped (weight 0), fusion reduces to the dense order.
+        let want = make_entity("dense-top", "insight", "k1", r#"{"n":"a"}"#);
+        let other = make_entity("dense-2", "insight", "k2", r#"{"n":"b"}"#);
+        let noise = make_entity("kw-noise", "insight", "k3", r#"{"n":"c"}"#);
+
+        let dense = vec![(want, 0.91), (other, 0.40)];
+        // Keyword arm ranks an irrelevant entity first.
+        let sparse = vec![(noise, 5.0)];
+
+        let fused =
+            crate::db::reciprocal_rank_fusion(&dense, &sparse, 60.0, 10, 0.0, None, 0);
+        assert_eq!(
+            fused[0].0.id, "dense-top",
+            "a weight-0 keyword arm must not displace the dense rank-1 hit"
+        );
+
+        // With full weight, the unweighted-RRF behavior is preserved: a tie at
+        // rank 0 between the two arms is broken deterministically by entity id.
+        let want2 = make_entity("dense-top", "insight", "k1", r#"{"n":"a"}"#);
+        let noise2 = make_entity("kw-noise", "insight", "k3", r#"{"n":"c"}"#);
+        let dense2 = vec![(want2, 0.91)];
+        let sparse2 = vec![(noise2, 5.0)];
+        let tied = crate::db::reciprocal_rank_fusion(&dense2, &sparse2, 60.0, 10, 1.0, None, 0);
+        // Both rank-0 in their arm → equal fused score → id tie-break (asc).
+        assert_eq!(tied[0].0.id, "dense-top");
+        assert_eq!(tied[1].0.id, "kw-noise");
+    }
+
+    #[test]
+    fn rrf_tie_break_is_deterministic_by_id() {
+        // Regression for #247 issue 2: equal fused scores must order by entity id,
+        // not by the (randomly-seeded) HashMap iteration order. Run a fused query
+        // many times over the same all-tied inputs; the order must never change.
+        let mut dense = Vec::new();
+        for i in 0..8 {
+            dense.push((
+                make_entity(&format!("e{i}"), "insight", &format!("k{i}"), r#"{"n":"x"}"#),
+                0.5, // identical scores → identical RRF ranks → all tied
+            ));
+        }
+        let first = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, 0);
+        let order: Vec<String> = first.iter().map(|(e, _)| e.id.clone()).collect();
+        // All scores equal, so id order must be ascending and stable.
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted, "all-tied results must be ordered by id ascending");
+        for _ in 0..50 {
+            let again = crate::db::reciprocal_rank_fusion(&dense, &[], 60.0, 10, 0.0, None, 0);
+            let again_order: Vec<String> = again.iter().map(|(e, _)| e.id.clone()).collect();
+            assert_eq!(again_order, order, "fused tie order must be deterministic");
+        }
+    }
+
+    #[test]
+    fn fts5_bm25_search_filters_stopwords_and_is_read_only() {
+        // Regression for #247: the hybrid keyword arm drops stopwords (so a
+        // natural-language paraphrase query doesn't match the whole corpus on
+        // function words) and never mutates access state.
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "espresso",
+            "habit",
+            "coffee",
+            r#"{"note": "I drink a strong espresso every morning"}"#,
+        ))
+        .unwrap();
+        db.remember(&make_entity(
+            "bike",
+            "habit",
+            "commute",
+            r#"{"note": "I usually bike to the office on weekdays"}"#,
+        ))
+        .unwrap();
+
+        // All-stopword query ("does the user...") → no content terms → empty arm.
+        let stop = db
+            .fts5_bm25_search(&RecallParams {
+                query: "does the user have any".to_string(),
+                limit: 10,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        assert!(
+            stop.is_empty(),
+            "a query of only stopwords must yield no keyword matches, got {:?}",
+            stop.iter().map(|(e, _)| &e.id).collect::<Vec<_>>()
+        );
+
+        // A content term still matches, and scores are relevance (higher better).
+        let hit = db
+            .fts5_bm25_search(&RecallParams {
+                query: "the espresso".to_string(),
+                limit: 10,
+                ..RecallParams::default()
+            })
+            .unwrap();
+        assert!(
+            hit.iter().any(|(e, _)| e.id == "espresso"),
+            "content term 'espresso' must match its memory"
+        );
+
+        // Read-only: retrieval_count must be unchanged after the keyword search.
+        let count: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT retrieval_count FROM entities WHERE id = 'espresso'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "fts5_bm25_search must not mutate retrieval_count");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hybrid_recall_is_read_only_and_idempotent() {
+        // Regression for #247: like dense mode, hybrid recall issues no
+        // access-state writes — repeated recalls return identical results and
+        // never bump retrieval_count/last_accessed/decay. A caller-supplied query
+        // embedding drives the dense arm so the test needs no ONNX backend.
+        let (db, path) = temp_db();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let insert = |id: &str, key: &str, body: &str, emb: &[f32]| {
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, archived)
+                     VALUES (?1, 'insight', ?2, ?3, 'insight', 'active', 0, 0, 0, 1.0, 'working', ?4, 0)",
+                    params![id, key, body, blob(emb)],
+                )
+                .unwrap();
+            // Keep the FTS index in sync so the keyword arm can match.
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities_fts (rowid, body_json)
+                     VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                    params![id, body],
+                )
+                .unwrap();
+        };
+        insert("e-coffee", "coffee", r#"{"note":"espresso every morning"}"#, &[1.0, 0.0, 0.0]);
+        insert("e-bike", "commute", r#"{"note":"bike to the office"}"#, &[0.0, 1.0, 0.0]);
+
+        let params = RecallParams {
+            query: "espresso".to_string(), // exercises the keyword arm too
+            mode: crate::models::SearchMode::Hybrid,
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            limit: 10,
+            ..RecallParams::default()
+        };
+
+        let first = db.recall(&params).unwrap();
+        assert!(
+            first.iter().any(|e| e.id == "e-coffee"),
+            "hybrid recall should surface the matching entity"
+        );
+
+        // No access-state writes: counts/timestamps stay at their seeded zero.
+        let (rc, la): (i64, i64) = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT retrieval_count, last_accessed_unix_ms FROM entities WHERE id = 'e-coffee'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rc, 0, "hybrid recall must not bump retrieval_count");
+        assert_eq!(la, 0, "hybrid recall must not touch last_accessed_unix_ms");
+
+        // Idempotent: a second identical recall returns the same ordering.
+        let second = db.recall(&params).unwrap();
+        let ids1: Vec<&str> = first.iter().map(|e| e.id.as_str()).collect();
+        let ids2: Vec<&str> = second.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids1, ids2, "repeated hybrid recall must be idempotent");
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
