@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimir-persist"
+version = "0.1.0"
+description = "Persistent FastMCP EventStore over SQLite — SSE resumability for MCP servers"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Perseus Computing LLC" }]
+keywords = ["mcp", "fastmcp", "eventstore", "sse", "resumability", "mimir"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+# Pinned: the EventStore ABC signature is SDK-version specific. 1.28.x exposes
+# store_event / replay_events_after in mcp.server.streamable_http.
+dependencies = [
+    "mcp==1.28.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.urls]
+Homepage = "https://github.com/Perseus-Computing-LLC/mimir"
+Repository = "https://github.com/Perseus-Computing-LLC/mimir"
+
+[tool.setuptools]
+packages = ["mimir_persist"]
+package-dir = { "" = "." }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
