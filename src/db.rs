@@ -4929,8 +4929,18 @@ mod tests {
         // sort key is the id tie-break. Insert in shuffled id order to prove the
         // ORDER BY — not insertion order — determines the result.
         let fixed_ts = 1_700_000_000_000_i64;
-        for raw_id in ["e3", "e1", "e5", "e2", "e4"] {
-            let mut e = make_entity(raw_id, "decision", raw_id, r#"{"d": "x"}"#);
+        // Distinct, low-overlap bodies so the 70%-trigram near-duplicate dedup in
+        // remember() does not collapse them into one row. Each body shares few
+        // trigrams with the others.
+        let bodies = [
+            ("e3", r#"{"d": "migrate authentication service to oauth tokens"}"#),
+            ("e1", r#"{"d": "adopt postgres sixteen for primary datastore"}"#),
+            ("e5", r#"{"d": "ship kubernetes ingress with rate limiting"}"#),
+            ("e2", r#"{"d": "rewrite billing pipeline using event sourcing"}"#),
+            ("e4", r#"{"d": "deprecate legacy graphql gateway by march"}"#),
+        ];
+        for (raw_id, body) in bodies {
+            let mut e = make_entity(raw_id, "decision", raw_id, body);
             e.retrieval_count = 0;
             e.last_accessed_unix_ms = fixed_ts;
             db.remember(&e).unwrap();
