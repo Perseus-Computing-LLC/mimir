@@ -17,6 +17,8 @@ COPY build.rs ./
 RUN cargo build --release --no-default-features && strip target/release/mimir
 
 FROM alpine:3.21
+# Ownership proof for the MCP Registry (must equal server.json "name").
+LABEL io.modelcontextprotocol.server.name="io.github.Perseus-Computing-LLC/mimir"
 RUN apk add --no-cache sqlite-libs
 COPY --from=builder /app/target/release/mimir /usr/local/bin/mimir
 ENTRYPOINT ["/usr/local/bin/mimir"]

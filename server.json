@@ -1,19 +1,25 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/mimir",
-  "title": "Mimir — Persistent Memory Engine for AI Agents",
-  "description": "MCP-native, local-first persistent memory for AI agents. Rust binary with SQLite+FTS5+hybrid vector search, Ebbinghaus decay, knowledge graph, journal audit trail, state management with TTL, AES-256-GCM encryption, vault import/export, and conflict detection. Zero network calls, no API keys required. 36 MCP tools over stdio/SSE/HTTP. Install: curl -sSf https://get.mimir.perseus.observer | sh",
-  "version": "2.0.0",
+  "title": "Mimir, persistent memory engine for AI agents",
+  "description": "MCP-native, local-first persistent memory for AI agents. A single Rust binary: SQLite with FTS5 plus hybrid vector search, AES-256-GCM encryption at rest, bi-temporal fact history, Ebbinghaus decay, journal audit trail, and conflict detection. Zero network calls, no API keys. 43 MCP tools over stdio. Distributed via GHCR and GitHub releases.",
+  "version": "2.6.0",
   "packages": [{
-    "registryType": "github",
-    "identifier": "Perseus-Computing-LLC/mimir",
-    "version": "2.0.0",
+    "registryType": "oci",
+    "identifier": "ghcr.io/perseus-computing-llc/mimir",
+    "version": "2.6.0",
+    "transport": {"type": "stdio"},
+    "runtimeHint": "docker",
+    "runtimeArguments": [
+      {"type": "named", "name": "-i"},
+      {"type": "named", "name": "--rm"},
+      {"type": "named", "name": "-v", "value": "mimir-data:/data"}
+    ],
     "packageArguments": [
       {"type": "positional", "value": "serve"},
       {"type": "positional", "value": "--db"},
-      {"type": "positional", "value": "~/.mimir/data/mimir.db"}
-    ],
-    "transport": {"type": "stdio"}
+      {"type": "positional", "value": "/data/mimir.db"}
+    ]
   }],
   "websiteUrl": "https://github.com/Perseus-Computing-LLC/mimir",
   "repository": {
