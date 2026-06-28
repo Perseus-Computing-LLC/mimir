@@ -2869,6 +2869,144 @@ impl Database {
         }))
     }
 
+    /// Invalidate a live entity by moving it into entity_history
+    /// (invalidated_at = now, superseded_by = `winner_id`) and removing it from
+    /// the live `entities` table, so it no longer appears in recall but remains
+    /// time-travelable via `as_of`. Reversible (the snapshot is kept) and
+    /// auditable. Returns false if `loser_id` is not a live, unarchived entity.
+    /// (v2.5.0 — D4 conflict invalidation; reuses the D2 supersession shape.)
+    pub fn invalidate_entity(
+        &self,
+        loser_id: &str,
+        winner_id: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let now = now_ms();
+        let history_id = format!(
+            "hist-{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+        );
+        let tx = conn.unchecked_transaction()?;
+        let moved = tx.execute(
+            "INSERT INTO entity_history
+             (history_id, id, category, key, body_json, status, type, tags, decay_score,
+              retrieval_count, layer, topic_path, archived, archive_reason, links, verified,
+              source, always_on, certainty, workspace_hash, agent_id, visibility,
+              valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms, invalidated_at_unix_ms,
+              supersedes, superseded_by, created_at_unix_ms, last_accessed_unix_ms)
+             SELECT ?1, id, category, key, body_json, status, type, tags, decay_score,
+              retrieval_count, layer, topic_path, archived, archive_reason, links, verified,
+              source, always_on, certainty, workspace_hash, agent_id, visibility,
+              valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms, ?2,
+              supersedes, ?3, created_at_unix_ms, last_accessed_unix_ms
+             FROM entities WHERE id = ?4 AND archived = 0",
+            params![history_id, now, winner_id, loser_id],
+        )?;
+        if moved == 0 {
+            // Not a live entity — nothing snapshotted; drop the tx (rollback).
+            return Ok(false);
+        }
+        // Remove from FTS first (its subquery needs the entities row to still exist),
+        // then from the live table.
+        tx.execute(
+            "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = ?1)",
+            params![loser_id],
+        )?;
+        tx.execute("DELETE FROM entities WHERE id = ?1", params![loser_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Opt-in active conflict resolution. Finds conflicting pairs in a category
+    /// (same heuristic as `detect_conflicts`) and, for each clear conflict where
+    /// the certainty gap is at least `certainty_margin`, invalidates the
+    /// lower-certainty entity (superseded by the higher-certainty one) via
+    /// `invalidate_entity`. Pairs whose certainties are within the margin are
+    /// skipped as ambiguous — never auto-resolved. `dry_run` reports what would
+    /// be invalidated without changing anything. (v2.5.0 — D4)
+    pub fn resolve_conflicts(
+        &self,
+        category: &str,
+        threshold: f64,
+        limit: i64,
+        offset: i64,
+        certainty_margin: f64,
+        dry_run: bool,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let entities: Vec<(String, String, String, f64)> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, key, body_json, certainty FROM entities WHERE category = ?1 AND archived = 0
+                 ORDER BY last_accessed_unix_ms DESC LIMIT 200 OFFSET ?2",
+            )?;
+            let rows = stmt.query_map(params![category, offset], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3).unwrap_or(0.5),
+                ))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut invalidated: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved = Vec::new();
+        let mut ambiguous = 0i64;
+
+        'outer: for i in 0..entities.len() {
+            for j in (i + 1)..entities.len() {
+                if resolved.len() as i64 >= limit {
+                    break 'outer;
+                }
+                let (ref id1, ref key1, ref body1, c1) = entities[i];
+                let (ref id2, ref key2, ref body2, c2) = entities[j];
+                // Skip anything already invalidated this pass.
+                if invalidated.contains(id1) || invalidated.contains(id2) {
+                    continue;
+                }
+                let sim = Self::trigram_similarity(body1, body2);
+                let min_cert = c1.min(c2);
+                let adj = if min_cert < 0.4 { threshold * 1.5 } else { threshold };
+                // A real conflict: dissimilar AND the pair is uncertain (mirrors
+                // detect_conflicts' conflict_likely).
+                let conflict_likely = sim < adj && (sim < 0.3 || min_cert < 0.3);
+                if !conflict_likely {
+                    continue;
+                }
+                // Refuse to auto-resolve when neither side is clearly more certain.
+                if (c1 - c2).abs() < certainty_margin {
+                    ambiguous += 1;
+                    continue;
+                }
+                let (winner_id, winner_key, win_c, loser_id, loser_key, lose_c) = if c1 >= c2 {
+                    (id1.clone(), key1.clone(), c1, id2.clone(), key2.clone(), c2)
+                } else {
+                    (id2.clone(), key2.clone(), c2, id1.clone(), key1.clone(), c1)
+                };
+                if !dry_run {
+                    self.invalidate_entity(&loser_id, &winner_id)?;
+                }
+                invalidated.insert(loser_id.clone());
+                resolved.push(serde_json::json!({
+                    "winner": {"id": winner_id, "key": winner_key, "certainty": win_c},
+                    "loser": {"id": loser_id, "key": loser_key, "certainty": lose_c},
+                    "similarity": sim,
+                }));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "category": category,
+            "entities_compared": entities.len(),
+            "resolved": resolved.len(),
+            "skipped_ambiguous": ambiguous,
+            "dry_run": dry_run,
+            "certainty_margin": certainty_margin,
+            "invalidations": resolved,
+        }))
+    }
+
     /// Permanently delete all archived entities and run VACUUM to reclaim disk space.
     /// This is the only way to actually remove entities; prune/forget only soft-archive.
     /// Deleted entities are NOT recoverable. Use dry_run=true to preview first.
@@ -4334,6 +4472,104 @@ mod tests {
             .expect("v2 is live from the supersede onward");
         assert!(now.body_json.contains("Berlin"), "as_of now must return the current version");
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_conflicts_invalidates_lower_certainty_via_history() {
+        let (db, path) = temp_db();
+        let mut win = make_entity(
+            "k-win-id",
+            "beliefs",
+            "k-win",
+            r#"{"note":"the capital city of germany is berlin since reunification"}"#,
+        );
+        win.certainty = 0.9;
+        db.remember(&win).unwrap();
+        let mut lose = make_entity(
+            "k-lose-id",
+            "beliefs",
+            "k-lose",
+            r#"{"note":"pineapple pizza is best enjoyed on rainy tuesday afternoons"}"#,
+        );
+        lose.certainty = 0.1;
+        db.remember(&lose).unwrap();
+
+        // Dry run reports the resolution but mutates nothing.
+        let preview = db.resolve_conflicts("beliefs", 0.4, 10, 0, 0.2, true).unwrap();
+        assert_eq!(preview["resolved"], serde_json::json!(1));
+        {
+            let conn = db.conn().unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM entities WHERE category='beliefs'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 2, "dry run must not invalidate anything");
+        }
+
+        // Real run: the low-certainty belief is invalidated into history.
+        let report = db.resolve_conflicts("beliefs", 0.4, 10, 0, 0.2, false).unwrap();
+        assert_eq!(report["resolved"], serde_json::json!(1));
+
+        let conn = db.conn().unwrap();
+        let live_lose: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE category='beliefs' AND key='k-lose'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_lose, 0, "loser removed from live entities");
+        let live_win: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE category='beliefs' AND key='k-win'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_win, 1, "winner stays live");
+        let superseded_by: String = conn
+            .query_row(
+                "SELECT superseded_by FROM entity_history WHERE category='beliefs' AND key='k-lose'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded_by, "k-win-id", "loser superseded by the winner id");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_conflicts_skips_ambiguous_equal_certainty() {
+        let (db, path) = temp_db();
+        let mut a = make_entity(
+            "a-id",
+            "beliefs2",
+            "a",
+            r#"{"note":"the earth orbits the sun once per year roughly"}"#,
+        );
+        a.certainty = 0.2;
+        db.remember(&a).unwrap();
+        let mut b = make_entity(
+            "b-id",
+            "beliefs2",
+            "b",
+            r#"{"note":"octopuses have three hearts and blue copper blood"}"#,
+        );
+        b.certainty = 0.2;
+        db.remember(&b).unwrap();
+
+        let report = db.resolve_conflicts("beliefs2", 0.4, 10, 0, 0.2, false).unwrap();
+        assert_eq!(
+            report["resolved"],
+            serde_json::json!(0),
+            "equal-certainty conflict is ambiguous, must not be auto-resolved"
+        );
+        assert!(report["skipped_ambiguous"].as_i64().unwrap() >= 1);
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities WHERE category='beliefs2'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "nothing invalidated when ambiguous");
         let _ = fs::remove_file(&path);
     }
 

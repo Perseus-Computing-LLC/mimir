@@ -973,6 +973,18 @@ pub struct ConflictArgs {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    /// Opt-in: actively invalidate the lower-certainty side of clear conflicts
+    /// (default false = read-only detection, the long-standing behavior).
+    #[serde(default)]
+    pub resolve: bool,
+    /// When resolving, only report what would change unless explicitly false.
+    /// Defaults true so an accidental `resolve:true` previews rather than mutates.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// Minimum certainty gap to auto-resolve a conflict; closer pairs are
+    /// skipped as ambiguous.
+    #[serde(default = "default_certainty_margin")]
+    pub certainty_margin: f64,
 }
 
 fn default_conflict_threshold() -> f64 {
@@ -980,6 +992,12 @@ fn default_conflict_threshold() -> f64 {
 }
 fn default_conflict_limit() -> i64 {
     10
+}
+fn default_true() -> bool {
+    true
+}
+fn default_certainty_margin() -> f64 {
+    0.2
 }
 
 pub fn handle_conflicts(db: &Database, args: Value) -> String {
@@ -989,6 +1007,20 @@ pub fn handle_conflicts(db: &Database, args: Value) -> String {
             return json!({"error": format!("Invalid conflicts arguments: {}", e)}).to_string()
         }
     };
+    if a.resolve {
+        return match db.resolve_conflicts(
+            &a.category,
+            a.threshold,
+            a.limit,
+            a.offset,
+            a.certainty_margin,
+            a.dry_run,
+        ) {
+            Ok(report) => serde_json::to_string(&report)
+                .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),
+            Err(e) => json!({"error": format!("Conflict resolution failed: {}", e)}).to_string(),
+        };
+    }
     match db.detect_conflicts(&a.category, a.threshold, a.limit, a.offset) {
         Ok(report) => serde_json::to_string(&report)
             .unwrap_or_else(|e| json!({"error": format!("{}", e)}).to_string()),

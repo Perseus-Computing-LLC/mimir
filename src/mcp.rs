@@ -1452,7 +1452,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_conflicts",
-    "description": "Detect conflicting entities in the same category \u2014 pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts that need human review.",
+    "description": "Detect conflicting entities in the same category \u2014 pairs with low trigram similarity in their body_json. Flags potential contradictions, duplicate-but-divergent entries, and stale-overwritten facts. Read-only by default. Opt in with resolve=true to actively invalidate the lower-certainty side of clear conflicts (superseding it into history, reversible + time-travelable via mimir_as_of); that path defaults to dry_run=true so you preview first, and never resolves pairs whose certainties are within certainty_margin.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1469,12 +1469,27 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "limit": {
           "type": "integer",
           "default": 10,
-          "description": "Maximum number of conflicts to return"
+          "description": "Maximum number of conflicts to return / resolve"
         },
         "offset": {
           "type": "integer",
           "default": 0,
           "description": "Number of entities to skip for pagination"
+        },
+        "resolve": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: invalidate the lower-certainty side of clear conflicts instead of only reporting them"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": true,
+          "description": "When resolve=true, only report what would be invalidated unless set false"
+        },
+        "certainty_margin": {
+          "type": "number",
+          "default": 0.2,
+          "description": "Minimum certainty gap to auto-resolve; closer pairs are skipped as ambiguous"
         }
       },
       "required": [
@@ -1489,12 +1504,19 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
           "items": {
             "type": "object"
           },
-          "description": "Conflict pairs with similarity scores"
+          "description": "Conflict pairs with similarity scores (detection mode)"
+        },
+        "invalidations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Winner/loser pairs invalidated or previewed (resolve mode)"
         }
       }
     },
     "annotations": {
-      "readOnlyHint": true
+      "readOnlyHint": false
     }
   },
   {
