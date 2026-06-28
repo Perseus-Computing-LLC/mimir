@@ -28,6 +28,10 @@ jobs:
           # so the real package must be present to collect the tests.
           - adapter: langgraph
             extra_deps: "langgraph"
+          # mimir-persist imports mcp.server.streamable_http at module load and
+          # pins the SDK version (the EventStore ABC signature is version-specific).
+          - adapter: mimir-persist
+            extra_deps: "mcp==1.28.1"
     steps:
       - uses: actions/checkout@v4
 
