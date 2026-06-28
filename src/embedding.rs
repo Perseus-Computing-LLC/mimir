@@ -367,29 +367,33 @@ fn generate_with_python(
 
     let model_str = config.model_path.to_string_lossy();
     let tokenizer_str = tokenizer_path.to_string_lossy();
-    let text_escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
 
-    let script = format!(
-        r#"
+    // Pass the tokenizer path, model path and text as argv, NOT interpolated into
+    // the script source. The previous version only escaped `\` and `'`, so a
+    // newline (or other control char) in the text broke out of the single-quoted
+    // Python string literal — a code-injection / DoS hazard since the text is
+    // agent/user-controlled. argv values are never parsed as Python code.
+    let script = r#"
 import sys, json, numpy as np
 try:
     import onnxruntime as ort
 except ImportError:
-    print(json.dumps({{"error": "onnxruntime not installed. Run: pip install onnxruntime"}}))
+    print(json.dumps({"error": "onnxruntime not installed. Run: pip install onnxruntime"}))
     sys.exit(1)
 
 try:
     from tokenizers import Tokenizer
-    tokenizer = Tokenizer.from_file('{}')
-    encoding = tokenizer.encode('{}')
+    tokenizer_path, model_path, text = sys.argv[1], sys.argv[2], sys.argv[3]
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    encoding = tokenizer.encode(text)
     input_ids = np.array([encoding.ids], dtype=np.int64)
     attention_mask = np.array([encoding.attention_mask], dtype=np.int64)
 
-    session = ort.InferenceSession('{}')
-    outputs = session.run(None, {{
+    session = ort.InferenceSession(model_path)
+    outputs = session.run(None, {
         'input_ids': input_ids,
         'attention_mask': attention_mask,
-    }})
+    })
     hidden = outputs[0]  # [1, seq_len, 384]
 
     # Mean pooling with attention mask
@@ -400,17 +404,18 @@ try:
     if norm > 0:
         pooled = pooled / norm
 
-    print(json.dumps({{"embedding": pooled.tolist()}}))
+    print(json.dumps({"embedding": pooled.tolist()}))
 except Exception as e:
-    print(json.dumps({{"error": str(e)}}))
+    print(json.dumps({"error": str(e)}))
     sys.exit(1)
-"#,
-        tokenizer_str, text_escaped, model_str
-    );
+"#;
 
     let output = std::process::Command::new("python3")
         .arg("-c")
-        .arg(&script)
+        .arg(script)
+        .arg(tokenizer_str.as_ref())
+        .arg(model_str.as_ref())
+        .arg(text)
         .output()
         .map_err(|e| {
             format!(

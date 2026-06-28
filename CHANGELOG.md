@@ -13,6 +13,7 @@ All notable changes to Mimir are documented here. This project adheres to
   meant to rebuild). It now decrypts each body (AAD `category:key`) and indexes the
   plaintext, matching what `remember` writes. Unencrypted DBs keep the fast bulk
   copy. Regression test added.
+
 ### Security
 - **Bounded file size for `mimir_ingest_file` (#236 hardening).** Document ingestion
   read the entire file into memory with no size limit, then copied the text into a
@@ -20,6 +21,13 @@ All notable changes to Mimir are documented here. This project adheres to
   the server (denial of service). Ingestion now rejects files larger than a
   configurable cap (`MIMIR_MAX_INGEST_BYTES`, default 50 MiB) **before** reading,
   for plaintext, DOCX and PDF alike. Regression test added.
+- **Python embedding fallback no longer interpolates text into its script.** The
+  lean-build ONNX fallback (`generate_with_python`) escaped only `\` and `'` when
+  embedding the (agent/user-controlled) text into a `python3 -c` source string, so
+  a newline or other control character could break out of the string literal — a
+  code-injection / DoS hazard. The tokenizer path, model path and text are now
+  passed as **`argv`** (never parsed as code). Affects only `--no-default-features`
+  builds (the default uses the in-process ONNX runtime).
 
 ## [2.5.0] - 2026-06-27
 
