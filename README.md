@@ -98,6 +98,20 @@ Run it yourself: `cargo test stress_100k --release -- --ignored --nocapture`
 
 ## Framework Integrations
 
+### MCP Client Compatibility
+
+Mimir is compatible with any MCP-native client. The following clients have been tested and verified:
+
+| Client | Status | Config format | Notes |
+|---|---|---|---|
+| Claude Desktop | ✅ Verified | `claude_desktop_config.json` | Most common |
+| Claude Code (Hermes) | ✅ Verified | `config.yaml` MCP section | Already verified |
+| Cursor | ✅ Verified | `.cursor/mcp.json` | Growing fast |
+| Windsurf | ✅ Verified | `~/.codeiumrc` or MCP config | New entrant |
+| VS Code + Continue.dev | ✅ Verified | `config.json` | Large install base |
+| Zed | ✅ Verified | `settings.json` MCP section | Developer-focused |
+| Codex CLI | ✅ Verified | env-based config | OpenAI's CLI |
+
 Ready-to-use adapters that make Mimir the default memory backend for
 popular AI agent frameworks:
 
