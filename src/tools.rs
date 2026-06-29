@@ -38,6 +38,8 @@ pub struct RememberArgs {
     pub agent_id: String,
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    #[serde(default)]
+    pub layer: Option<String>,
 }
 
 fn default_certainty() -> f64 {
@@ -100,6 +102,8 @@ pub struct RecallArgs {
     pub workspace_hash: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub layer: Option<String>,
 }
 
 fn default_halving() -> f64 {
@@ -287,6 +291,13 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
     let id = format!("mem-{}", &raw_id[..12.min(raw_id.len())]);
     let now = now_ms();
 
+    let layer = a.layer.map(|l| match l.as_str() {
+        "world" => "core".to_string(),
+        "episodic" => "buffer".to_string(),
+        "semantic" => "working".to_string(),
+        _ => l,
+    }).unwrap_or_else(|| "buffer".to_string());
+
     let entity = Entity {
         id,
         category: a.category,
@@ -297,7 +308,7 @@ pub fn handle_remember(db: &Database, args: Value) -> Result<String, String> {
         tags: a.tags,
         decay_score: a.importance,
         retrieval_count: 0,
-        layer: "buffer".to_string(),
+        layer,
         topic_path: a.topic_path,
         archived: false,
         archive_reason: String::new(),
@@ -377,6 +388,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         workspace_hash: a.workspace_hash.clone(),
         agent_id: a.agent_id.clone(),
         visibility: None,
+        layer: a.layer.clone(),
     };
 
     let entities = db
@@ -502,6 +514,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             workspace_hash: a.workspace_hash.clone(),
             agent_id: a.agent_id.clone(),
             visibility: None,
+            layer: a.layer.clone(),
         };
 
         if let Ok(entities) = db.recall(&params) {
@@ -540,6 +553,33 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
         "variants": variants.len(),
     });
     Ok(result.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecallLayerArgs {
+    pub layer: String,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+pub fn handle_recall_layer(db: &Database, args: Value) -> Result<String, String> {
+    let a: RecallLayerArgs =
+        serde_json::from_value(args).map_err(|e| format!("Invalid recall_layer arguments: {}", e))?;
+
+    let layer = match a.layer.as_str() {
+        "world" => "core",
+        "episodic" => "buffer",
+        "semantic" => "working",
+        _ => &a.layer,
+    };
+
+    let recall_args = json!({
+        "query": "",
+        "limit": a.limit,
+        "layer": layer,
+    });
+
+    handle_recall(db, recall_args)
 }
 
 /// #103: Get a single entity by ID with full body (for drill-down after preview cap).

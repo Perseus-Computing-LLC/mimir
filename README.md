@@ -123,6 +123,7 @@ Any MCP-compatible framework works with Mimir directly. See
 |---|---|
 | `mimir_remember` | Store/update entity. Idempotent by (category, key); a content change snapshots the prior version into history. |
 | `mimir_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. |
+| `mimir_recall_layer` | Recall from a specific biomimetic layer (world, episodic, semantic). |
 | `mimir_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match. |
 | `mimir_get_entity` | Fetch one entity by ID with full `body_json`. |
 | `mimir_as_of` | Bi-temporal time-travel: the version of a fact (category + key) that was live at a past instant. |
@@ -332,8 +333,16 @@ stale memories fade — your knowledge base stays yours and stays fresh.
 - **Dense vector search** via cosine similarity on stored embeddings
 - **Reciprocal Rank Fusion (RRF)** — combine keyword + vector results
 - **Query expansion** — automatic stemming variants for broader recall
-
 ### Memory Lifecycle
+
+Mimir models memory using three biomimetic layers, inspired by human memory pathways:
+
+- **World (Core):** Slow-decaying, global facts about the environment.
+- **Episodic (Buffer):** Fast-decaying, session-specific interaction history.
+- **Semantic (Working):** Medium-decaying, general knowledge and learned concepts.
+
+You can interact with these layers directly using the `mimir_recall_layer` tool or by specifying the `layer` parameter in `mimir_remember`.
+
 - **Ebbinghaus decay** — memories naturally fade unless retrieved (refresh on access)
 - **Layer promotion** — buffer → working → core based on access frequency
 - **Automatic archival** — stale entities archive; purge to permanently delete + VACUUM

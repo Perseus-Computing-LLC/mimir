@@ -217,6 +217,7 @@ pub struct RecallParams {
     // Kept so the filter can be wired without a signature change.
     #[allow(dead_code)]
     pub visibility: Option<String>,
+    pub layer: Option<String>,
 }
 
 /// Search mode for recall: FTS5 keyword, dense vector, or hybrid fusion.
@@ -280,6 +281,7 @@ impl Default for RecallParams {
             workspace_hash: None,
             agent_id: None,
             visibility: None,
+            layer: None,
         }
     }
 }

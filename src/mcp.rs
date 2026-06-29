@@ -400,6 +400,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "agent_id": {
           "type": "string",
           "description": "Agent identity filter (v1.2.0). When set, only entities with a matching agent_id are returned. Omit for no agent filtering."
+        },
+        "layer": {
+            "type": "string",
+            "description": "Filter by memory layer (world, episodic, semantic)."
         }
       },
       "required": [
@@ -423,6 +427,43 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "variants": {
           "type": "integer",
           "description": "Number of query variants used when expansion is enabled"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "mimir_recall_layer",
+    "description": "Recall entities from a specific biomimetic memory layer (world, episodic, semantic).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "layer": {
+          "type": "string",
+          "description": "The memory layer to recall from.",
+          "enum": ["world", "episodic", "semantic"]
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "description": "Maximum number of results to return (max 1000)."
+        }
+      },
+      "required": ["layer"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "Matching entities with expanded body_json fields at top level."
+        },
+        "total": {
+          "type": "integer",
+          "description": "Number of results returned."
         }
       }
     },
@@ -2228,6 +2269,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 
         "mimir_recall" => tools::handle_recall(db, args).map_err(|e| e.to_string()),
+
+        "mimir_recall_layer" => tools::handle_recall_layer(db, args).map_err(|e| e.to_string()),
 
         "mimir_semantic_search" => {
             tools::handle_semantic_search(db, args).map_err(|e| e.to_string())
