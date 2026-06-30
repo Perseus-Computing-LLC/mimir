@@ -14,7 +14,7 @@ pub struct EncryptionManager {
 pub enum BodyDecrypt {
     /// Ciphertext that authenticated and decrypted successfully.
     Plaintext(String),
-    /// The stored value is not Mimir ciphertext at all (a legacy plaintext row);
+    /// The stored value is not Mneme ciphertext at all (a legacy plaintext row);
     /// it is safe to use as-is. JSON bodies always start with `{`, which is not in
     /// the base64 alphabet, so real plaintext is reliably classified here.
     LegacyPlaintext(String),
@@ -102,7 +102,7 @@ impl EncryptionManager {
             // Not base64 -> cannot be our ciphertext -> legacy plaintext row.
             Err(_) => return BodyDecrypt::LegacyPlaintext(encoded.to_string()),
         };
-        // Mimir ciphertext is nonce(12) + GCM tag(16) + body(>=0) = >= 28 bytes.
+        // Mneme ciphertext is nonce(12) + GCM tag(16) + body(>=0) = >= 28 bytes.
         // Anything shorter is not our ciphertext.
         if combined.len() < 12 + 16 {
             return BodyDecrypt::LegacyPlaintext(encoded.to_string());

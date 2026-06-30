@@ -1,9 +1,9 @@
-// gRPC server — maps all Mimir MCP tools to protobuf RPCs.
+// gRPC server — maps all Mneme MCP tools to protobuf RPCs.
 // Enabled via "grpc" feature flag. Compiles the proto in build.rs.
 
 #[cfg(feature = "grpc")]
 pub mod grpc {
-    tonic::include_proto!("mimir.v1");
+    tonic::include_proto!("mneme.v1");
 
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status, Streaming};
@@ -11,11 +11,11 @@ pub mod grpc {
     use crate::db::Database;
     use crate::models;
 
-    pub struct MimirGrpcServer {
+    pub struct MnemeGrpcServer {
         db: Arc<Mutex<Database>>,
     }
 
-    impl MimirGrpcServer {
+    impl MnemeGrpcServer {
         pub fn new(db: Arc<Mutex<Database>>) -> Self {
             Self { db }
         }
@@ -23,7 +23,7 @@ pub mod grpc {
 
     // Helper to run DB operations inside the mutex
     fn with_db<T>(
-        server: &MimirGrpcServer,
+        server: &MnemeGrpcServer,
         f: impl FnOnce(&Database) -> Result<T, Box<dyn std::error::Error>>,
     ) -> Result<T, Status> {
         let db = server.db.lock().map_err(|_| Status::internal("lock poisoned"))?;
@@ -31,7 +31,7 @@ pub mod grpc {
     }
 
     #[tonic::async_trait]
-    impl mimir_server::Mimir for MimirGrpcServer {
+    impl mneme_server::Mneme for MnemeGrpcServer {
         // ── CRUD ──
         async fn remember(&self, req: Request<RememberRequest>) -> Result<Response<RememberResponse>, Status> {
             let r = req.into_inner();
@@ -266,9 +266,9 @@ pub mod grpc {
         addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use tonic::transport::Server;
-        let svc = MimirGrpcServer::new(db);
+        let svc = MnemeGrpcServer::new(db);
         Server::builder()
-            .add_service(mimir_server::MimirServer::new(svc))
+            .add_service(mneme_server::MnemeServer::new(svc))
             .serve(addr)
             .await?;
         Ok(())

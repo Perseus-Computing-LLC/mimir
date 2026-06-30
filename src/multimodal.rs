@@ -1,7 +1,7 @@
 //! Local multimodal document text extraction (#236).
 //!
 //! Turns a document file into plain text for storage in memory, entirely
-//! locally — no cloud parsing API, no network — preserving Mimir's air-gapped
+//! locally — no cloud parsing API, no network — preserving Mneme's air-gapped
 //! ethos. Plaintext / markdown / structured-text formats work in any build;
 //! **DOCX and PDF extraction is behind the optional `multimodal` feature** so the
 //! lean default binary stays dependency-free. Without the feature, requesting a

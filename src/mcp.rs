@@ -203,14 +203,32 @@ pub fn handle_request(
     }
 }
 
+/// Given a `mimir_*` tool definition from the static registry, return a clone
+/// advertised under the equivalent `mneme_*` name (Mneme rename, transition
+/// release — both names dispatch to the same handler via `call_tool`).
+/// Returns `None` for entries that, unexpectedly, aren't named `mimir_*`.
+fn mneme_alias_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
+    let name = tool.get("name")?.as_str()?;
+    let suffix = name.strip_prefix("mimir_")?;
+    let mut alias = tool.clone();
+    alias["name"] = serde_json::Value::String(format!("mneme_{}", suffix));
+    Some(alias)
+}
+
 /// Build the tools/list response with all 44 tools including outputSchema and annotations.
 fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     // The tool registry is a compile-time constant. Parse it exactly once per
     // process and reuse the cached Value instead of re-parsing ~1.8k lines of
     // JSON on every tools/list request (perf review #208).
+    //
+    // Mneme rename (transition release): the canonical registry below still
+    // declares every tool under its original "mimir_*" name. We additionally
+    // synthesize a "mneme_*" alias entry for each one so clients that have
+    // already moved to the new product name see matching tools/list output.
+    // Both names dispatch to the same handler in `call_tool` below.
     static TOOLS: OnceLock<serde_json::Value> = OnceLock::new();
     let tools_json = TOOLS.get_or_init(|| {
-        serde_json::from_str::<serde_json::Value>(
+        let base = serde_json::from_str::<serde_json::Value>(
         r###"[
   {
     "name": "mimir_remember",
@@ -673,7 +691,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_as_of",
-    "description": "Bi-temporal time-travel: return the version of a fact (category + key) that Mimir believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. Returns found=false if the fact had not been recorded yet at that time.",
+    "description": "Bi-temporal time-travel: return the version of a fact (category + key) that Mneme believed at a given past instant. When a fact is overwritten, the prior version is kept in history; this returns whichever version was live at as_of_unix_ms. Use to answer 'what did we believe about X back then?' or to audit how a fact changed. Returns found=false if the fact had not been recorded yet at that time.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -781,7 +799,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_ingest",
-    "description": "Sync external data connectors (GitHub issues, file watcher) into Mimir. Call with no arguments to run all enabled connectors, or specify a connector name to run only that one. Use dry_run=true to preview without storing.",
+    "description": "Sync external data connectors (GitHub issues, file watcher) into Mneme. Call with no arguments to run all enabled connectors, or specify a connector name to run only that one. Use dry_run=true to preview without storing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1365,7 +1383,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_health",
-    "description": "Check whether the Mimir server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
+    "description": "Check whether the Mneme server and its SQLite database are healthy. Returns a simple healthy/unhealthy status. Use this for health checks and monitoring, not for detailed stats (use mimir_stats).",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1528,7 +1546,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_migrate",
-    "description": "Migrate a v0.1.x Mimir database to the current v0.5.0 schema. Reads the old database, converts memories to the entity model, and merges into the current database. Use this once per legacy database during upgrade.",
+    "description": "Migrate a v0.1.x Mneme database to the current v0.5.0 schema. Reads the old database, converts memories to the entity model, and merges into the current database. Use this once per legacy database during upgrade.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2383,7 +2401,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
   },
   {
     "name": "mimir_bench",
-    "description": "Record a performance benchmark data point. Tracks task metrics (turns taken, tokens used, success) alongside whether memory recall was used — enabling measurement of Mimir's impact on agent performance. Aggregate with mimir_recall to analyze trends.",
+    "description": "Record a performance benchmark data point. Tracks task metrics (turns taken, tokens used, success) alongside whether memory recall was used — enabling measurement of Mneme's impact on agent performance. Aggregate with mimir_recall to analyze trends.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2656,7 +2674,17 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     "title": "Run Database Maintenance"
   }
 ]"###
-        ).expect("tools JSON must be valid")
+        ).expect("tools JSON must be valid");
+
+        let base_array = base.as_array().expect("tools registry must be a JSON array");
+        let mut aliased: Vec<serde_json::Value> = Vec::with_capacity(base_array.len() * 2);
+        for tool in base_array {
+            aliased.push(tool.clone());
+            if let Some(mneme_alias) = mneme_alias_tool(tool) {
+                aliased.push(mneme_alias);
+            }
+        }
+        serde_json::Value::Array(aliased)
     });
 
     JsonRpcResponse {
@@ -2669,6 +2697,14 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
     }
 }
 fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> String {
+    // Mneme rename (transition release): "mneme_*" is a back-compat alias for
+    // "mimir_*" — normalize it once here so every match arm below keeps
+    // dispatching on the original name without needing its own alias arm.
+    let owned_name = name
+        .strip_prefix("mneme_")
+        .map(|suffix| format!("mimir_{}", suffix));
+    let name: &str = owned_name.as_deref().unwrap_or(name);
+
     let handler_result: Result<String, String> = match name {
         "mimir_remember" => tools::handle_remember(db, args).map_err(|e| e.to_string()),
 

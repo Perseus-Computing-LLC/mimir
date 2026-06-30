@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS entities (
     -- before bi-temporal support, so existing rows need no interpretation change.
     valid_from_unix_ms INTEGER,      -- when the fact became true in the world (NULL = since creation)
     valid_to_unix_ms INTEGER,        -- when it stopped being true (NULL = still true)
-    recorded_at_unix_ms INTEGER,     -- transaction time: when Mimir first knew it (backfilled = created_at)
-    invalidated_at_unix_ms INTEGER,  -- transaction time: when Mimir retired it (NULL = live)
+    recorded_at_unix_ms INTEGER,     -- transaction time: when Mneme first knew it (backfilled = created_at)
+    invalidated_at_unix_ms INTEGER,  -- transaction time: when Mneme retired it (NULL = live)
     supersedes TEXT DEFAULT '',      -- id of the entity this one replaced
     superseded_by TEXT DEFAULT ''    -- id of the entity that replaced this one
 );
@@ -222,7 +222,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Er
         conn.execute_batch("ALTER TABLE entities ADD COLUMN superseded_by TEXT DEFAULT '';")?;
     }
     // Backfill transaction time for pre-existing rows: a fact's recorded_at is
-    // when Mimir first stored it, i.e. its created_at. (No-op on a fresh DB.)
+    // when Mneme first stored it, i.e. its created_at. (No-op on a fresh DB.)
     conn.execute_batch(
         "UPDATE entities SET recorded_at_unix_ms = created_at_unix_ms \
          WHERE recorded_at_unix_ms IS NULL;",
