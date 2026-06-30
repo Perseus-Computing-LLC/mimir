@@ -139,6 +139,19 @@ fn apply_confidence(items: &mut [serde_json::Value], entities: &[crate::models::
     }
 }
 
+/// Map a biomimetic layer alias (world/episodic/semantic) to its canonical
+/// storage layer (core/buffer/working). Any other value passes through, so
+/// callers may also filter by the raw layer name.
+fn canonical_layer(s: &str) -> String {
+    match s {
+        "world" => "core",
+        "episodic" => "buffer",
+        "semantic" => "working",
+        other => other,
+    }
+    .to_string()
+}
+
 fn default_halving() -> f64 {
     1.0
 }
@@ -421,7 +434,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         workspace_hash: a.workspace_hash.clone(),
         agent_id: a.agent_id.clone(),
         visibility: None,
-        layer: a.layer.clone(),
+        layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
     };
 
     let entities = db
@@ -551,7 +564,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             workspace_hash: a.workspace_hash.clone(),
             agent_id: a.agent_id.clone(),
             visibility: None,
-            layer: a.layer.clone(),
+            layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
         };
 
         if let Ok(entities) = db.recall(&params) {

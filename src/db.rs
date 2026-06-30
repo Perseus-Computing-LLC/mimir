@@ -1467,6 +1467,18 @@ impl Database {
     }
 
     /// Search entities with FTS5 + LIKE fallback and optional filters.
+    /// Drop entities whose layer doesn't match `params.layer` (when set). Applied
+    /// post-search so it also covers the dense arm of dense/hybrid recall, which
+    /// scores vectors without access to RecallParams (#269/#272). The keyword
+    /// paths additionally pre-filter in-query (cheaper, pre-limit).
+    fn retain_layer(entities: &mut Vec<Entity>, params: &RecallParams) {
+        if let Some(ref layer) = params.layer {
+            if !layer.is_empty() {
+                entities.retain(|e| e.layer == *layer);
+            }
+        }
+    }
+
     pub fn recall(&self, params: &RecallParams) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         // Dense vector search path
         if params.mode == crate::models::SearchMode::Dense
@@ -1489,7 +1501,9 @@ impl Database {
             if let Some(query_vec) = query_vec {
                 if params.mode == crate::models::SearchMode::Dense {
                     let dense_results = self.dense_search(query_vec, params.limit as usize)?;
-                    return Ok(dense_results.into_iter().map(|(e, _)| e).collect());
+                    let mut out: Vec<Entity> = dense_results.into_iter().map(|(e, _)| e).collect();
+                    Self::retain_layer(&mut out, params);
+                    return Ok(out);
                 }
 
                 // Hybrid: fuse the dense vectors with a read-only, BM25-ranked,
@@ -1523,12 +1537,16 @@ impl Database {
                     params.recency_half_life_secs,
                     now_ms(),
                 );
-                return Ok(fused.into_iter().map(|(e, _)| e).collect());
+                let mut out: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
+                Self::retain_layer(&mut out, params);
+                return Ok(out);
             }
             // Empty query: nothing to embed, fall through to FTS5
         }
 
-        self.fts5_search(params)
+        let mut results = self.fts5_search(params)?;
+        Self::retain_layer(&mut results, params);
+        Ok(results)
     }
 
     /// Core FTS5 + LIKE keyword search (extracted for reuse by recall and hybrid).
@@ -1648,6 +1666,16 @@ impl Database {
         if let Some(ref aid) = params.agent_id {
             conditions.push(format!("agent_id = ?{}", param_values.len() + 1));
             param_values.push(Box::new(aid.clone()));
+        }
+
+        // Filter by biomimetic memory layer (#269/#272): core/buffer/working.
+        // Aliases (world/episodic/semantic) are normalized to canonical layers
+        // by the tools layer before reaching here.
+        if let Some(ref layer) = params.layer {
+            if !layer.is_empty() {
+                conditions.push(format!("layer = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(layer.clone()));
+            }
         }
 
         // Exclude archived unless explicitly requested
@@ -1897,6 +1925,13 @@ impl Database {
         if let Some(ref aid) = params.agent_id {
             conditions.push(format!("e.agent_id = ?{}", param_values.len() + 1));
             param_values.push(Box::new(aid.clone()));
+        }
+        // Biomimetic layer filter (#269/#272): core/buffer/working.
+        if let Some(ref layer) = params.layer {
+            if !layer.is_empty() {
+                conditions.push(format!("e.layer = ?{}", param_values.len() + 1));
+                param_values.push(Box::new(layer.clone()));
+            }
         }
 
         let safe_limit = params.limit.clamp(0, 1000);
