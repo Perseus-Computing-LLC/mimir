@@ -15,6 +15,13 @@ All notable changes to Mimir are documented here. This project adheres to
   semantic are normalized to core/buffer/working at the tools layer.
 
 ### Added
+- **`mimir doctor` + verified client compatibility matrix (#272).** New `mimir doctor`
+  subcommand validates the local install (binary path, db path) and prints the MCP
+  stdio config plus a compatibility matrix for Claude Desktop, Claude Code/Hermes,
+  Cursor, Windsurf, VS Code+Continue.dev, Zed, and Codex CLI. Added a "Works With
+  Every MCP Client" table to the README and copy-paste config snippets in
+  `docs/clients/`. Mimir is a standard MCP stdio server, so the same command works
+  everywhere — this documents and self-checks it.
 - **`include_confidence` on `mimir_recall` (#287).** Opt-in (default false): each result
   gains a normalized `confidence` (0.0–1.0) rolled up from rank, trust (verified/certainty),
   and decay — a single number for callers/UIs instead of eyeballing raw signals. Purely
