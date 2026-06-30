@@ -16,18 +16,20 @@ mod web;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "mimir")]
+#[command(name = "mneme")]
 #[command(
-    about = "Mimir — persistent memory for AI agents — MCP JSON-RPC stdio server",
+    about = "Mneme — persistent memory for AI agents — MCP JSON-RPC stdio server",
     version
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// SQLite database path (default: $MIMIR_DB_PATH or ~/.mimir/data/mimir.db).
-    /// Used when running the server directly without the `serve` subcommand —
-    /// matches the documented MCP host config: `mimir --db /path/to/mimir.db`.
+    /// SQLite database path (default: $MIMIR_DB_PATH or ~/.mimir/data/mneme.db,
+    /// falling back to an existing ~/.mimir/data/mimir.db from before the
+    /// Mneme rename). Used when running the server directly without the
+    /// `serve` subcommand — matches the documented MCP host config:
+    /// `mneme --db /path/to/mneme.db`.
     #[arg(long)]
     db: Option<String>,
 
@@ -221,7 +223,7 @@ enum Commands {
         offline: bool,
     },
 
-    /// Migrate a v0.1.x Mimir database to v0.2.0 schema
+    /// Migrate a v0.1.x Mneme database to v0.2.0 schema
     Migrate {
         /// Path to the source v0.1.x database
         #[arg(long)]
@@ -330,7 +332,7 @@ enum Commands {
         vault_dir: String,
     },
 
-    /// Sync your Mimir memory into an Obsidian (or Logseq/Notion) vault as
+    /// Sync your Mneme memory into an Obsidian (or Logseq/Notion) vault as
     /// linked Markdown notes. Wraps vault export and writes `[[WikiLink]]`
     /// backlinks between related entities so your AI memory becomes a
     /// navigable personal knowledge base. Pass `--watch` to re-export on every
@@ -339,7 +341,7 @@ enum Commands {
     ObsidianSync {
         /// Target Obsidian vault directory (created if needed)
         vault_path: String,
-        /// SQLite database path (defaults to $MIMIR_DB_PATH or ~/.mimir/data/mimir.db)
+        /// SQLite database path (defaults to $MIMIR_DB_PATH or ~/.mimir/data/mneme.db)
         #[arg(long)]
         db: Option<String>,
         /// Continuously re-export whenever memory changes
@@ -413,6 +415,13 @@ fn apply_top_level_db(cli: &mut Cli) {
     }
 }
 
+/// Resolve the default database path.
+///
+/// Mneme rename: fresh installs default to `mneme.db`. If a pre-rename
+/// `mimir.db` already exists at the same directory (and no `mneme.db` does),
+/// we keep using it so upgraders don't silently start over with an empty
+/// database — same fallback shape as the legacy `~/mimir.db` -> `~/.mimir/data/`
+/// move handled by `check_legacy_db` below.
 fn default_db_path() -> String {
     std::env::var("MIMIR_DB_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME")
@@ -423,7 +432,13 @@ fn default_db_path() -> String {
             });
         let dir = format!("{}/.mimir/data", home);
         let _ = std::fs::create_dir_all(&dir);
-        format!("{}/mimir.db", dir)
+        let mneme_path = format!("{}/mneme.db", dir);
+        let mimir_path = format!("{}/mimir.db", dir);
+        if !std::path::Path::new(&mneme_path).exists() && std::path::Path::new(&mimir_path).exists() {
+            mimir_path
+        } else {
+            mneme_path
+        }
     })
 }
 
@@ -483,10 +498,10 @@ fn print_json<T: serde::Serialize>(value: &T) {
     }
 }
 
-/// #272: `mimir doctor` — validate the local install + config and report which
-/// MCP clients Mimir works with. ASCII-only output (cross-platform console safe).
+/// #272: `mneme doctor` — validate the local install + config and report which
+/// MCP clients Mneme works with. ASCII-only output (cross-platform console safe).
 fn run_doctor(db_path: &str) {
-    println!("mimir doctor — v{}", env!("CARGO_PKG_VERSION"));
+    println!("mneme doctor — v{}", env!("CARGO_PKG_VERSION"));
     match std::env::current_exe() {
         Ok(p) => println!("  binary:   {}", p.display()),
         Err(_) => println!("  binary:   (unknown)"),
@@ -502,10 +517,10 @@ fn run_doctor(db_path: &str) {
     println!("  database: {} ({})", db_path, db_status);
 
     println!("\nMCP stdio config (identical for every client below):");
-    println!("  command: mimir");
+    println!("  command: mneme");
     println!("  args:    [\"serve\", \"--db\", \"{}\"]", db_path);
 
-    println!("\nClient compatibility (Mimir is a standard MCP stdio server):");
+    println!("\nClient compatibility (Mneme is a standard MCP stdio server):");
     let clients = [
         ("Claude Desktop", "claude_desktop_config.json"),
         ("Claude Code / Hermes", ".mcp.json or config.yaml"),
@@ -519,7 +534,7 @@ fn run_doctor(db_path: &str) {
         println!("  [OK] {:<24} {}", name, cfg);
     }
     println!("\nPer-client copy-paste snippets: docs/clients/");
-    println!("All checks passed: Mimir speaks MCP stdio, so any MCP client works.");
+    println!("All checks passed: Mneme speaks MCP stdio, so any MCP client works.");
 }
 
 fn main() {

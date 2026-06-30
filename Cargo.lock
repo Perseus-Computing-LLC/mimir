@@ -1498,42 +1498,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "mimir"
-version = "2.7.0"
-dependencies = [
- "aes-gcm",
- "async-stream",
- "axum 0.7.9",
- "base64 0.22.1",
- "clap",
- "futures",
- "ndarray",
- "notify",
- "ort",
- "pdf-extract",
- "prost 0.14.4",
- "prost-types 0.14.4",
- "r2d2",
- "r2d2_sqlite",
- "rand 0.8.6",
- "rusqlite",
- "rust-stemmers",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokenizers",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tower",
- "tower-http",
- "ureq 2.12.1",
- "uuid",
- "zip",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1570,6 +1534,42 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mneme"
+version = "2.7.0"
+dependencies = [
+ "aes-gcm",
+ "async-stream",
+ "axum 0.7.9",
+ "base64 0.22.1",
+ "clap",
+ "futures",
+ "ndarray",
+ "notify",
+ "ort",
+ "pdf-extract",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
+ "r2d2",
+ "r2d2_sqlite",
+ "rand 0.8.6",
+ "rusqlite",
+ "rust-stemmers",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tower",
+ "tower-http",
+ "ureq 2.12.1",
+ "uuid",
+ "zip",
 ]
 
 [[package]]

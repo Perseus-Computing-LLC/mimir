@@ -5,6 +5,21 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+- **Product rename: Mimir → Mneme.** Avoids a trademark/SEO collision with
+  Grafana Mimir and a same-niche competitor also named Mimir. The crate and
+  `[[bin]]` are now `mneme`; the default database for fresh installs is
+  `~/.mimir/data/mneme.db` (an existing `mimir.db` at that path is still used
+  automatically, so upgraders keep their data — see `default_db_path()` in
+  `src/main.rs`). Every `mimir_*` MCP tool is now also registered under the
+  equivalent `mneme_*` name — both dispatch to the same handler, so existing
+  MCP host configs that call `mimir_remember`/`mimir_recall`/etc. keep working
+  unchanged during the transition. `mimir doctor`/`--help` output now refers to
+  the `mneme` binary. Internal-only Rust identifiers (`MimirGrpcServer`, the
+  optional `grpc` feature's generated `Mimir`/`MimirServer` proto types) are
+  renamed to their `Mneme` equivalents with no back-compat surface, since
+  nothing outside the binary depends on them.
+
 ### Fixed
 - **`layer` filter on `mimir_recall` now actually filters (#269 follow-up).** The
   `layer` recall parameter was accepted but never applied — `RecallParams.layer`

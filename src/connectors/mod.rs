@@ -5,7 +5,7 @@ use crate::models::RawDocument;
 use std::sync::atomic::AtomicI64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Trait for external data connectors that ingest documents into Mimir.
+/// Trait for external data connectors that ingest documents into Mneme.
 pub trait Connector: Send + Sync {
     fn name(&self) -> &str;
     fn fetch(&self) -> Result<Vec<RawDocument>, String>;

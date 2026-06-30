@@ -1,5 +1,5 @@
 [package]
-name = "mimir"
+name = "mneme"
 version = "2.7.0"
 edition = "2021"
 description = "Persistent memory engine for AI agents — MCP JSON-RPC stdio server"
@@ -7,7 +7,7 @@ repository = "https://github.com/Perseus-Computing-LLC/mimir"
 license = "MIT"
 
 [[bin]]
-name = "mimir"
+name = "mneme"
 path = "src/main.rs"
 
 [dependencies]

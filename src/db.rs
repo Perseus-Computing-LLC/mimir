@@ -2321,7 +2321,7 @@ impl Database {
 
     /// The version of (category, key) that was the live fact at transaction time
     /// `as_of_unix_ms` — recorded at or before T and not yet superseded at T.
-    /// Bi-temporal time-travel: "what did Mimir believe about this at time T?".
+    /// Bi-temporal time-travel: "what did Mneme believe about this at time T?".
     /// Returns None if the fact had not been recorded yet at T. (v2.4.0)
     ///
     /// Versions partition time contiguously: each historical version was live
@@ -3884,7 +3884,7 @@ last_accessed: {}
         }
 
         // Format as markdown
-        let mut ctx = String::from("## Mimir Context\n\n");
+        let mut ctx = String::from("## Mneme Context\n\n");
 
         // Always-on entities first, visually distinct
         if !always_on_entities.is_empty() {

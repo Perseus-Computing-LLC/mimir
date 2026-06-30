@@ -111,7 +111,7 @@ pub struct RecallArgs {
     pub include_confidence: bool,
 }
 
-/// #287: presentation-layer confidence rollup over signals Mimir already has.
+/// #287: presentation-layer confidence rollup over signals Mneme already has.
 /// Does NOT affect ranking — purely a convenience score for the caller.
 fn confidence_for(entity: &crate::models::Entity, rank: usize, total: usize) -> f64 {
     let relevance = if total > 1 {
