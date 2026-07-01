@@ -1,14 +1,14 @@
-# Contributing to Mneme
+# Contributing to Perseus Vault
 
-Thanks for wanting to help! Mneme is a Rust MCP server for persistent AI agent
+Thanks for wanting to help! Perseus Vault is a Rust MCP server for persistent AI agent
 memory. Contributions of all kinds are welcome — code, docs, bug reports, feature
 ideas.
 
 ## Development Setup
 
 ```bash
-git clone https://github.com/Perseus-Computing-LLC/mneme.git
-cd mneme
+git clone https://github.com/Perseus-Computing-LLC/perseus-vault.git
+cd perseus-vault
 
 # Build (requires Rust 1.70+)
 cargo build --release
@@ -49,5 +49,5 @@ Keep PRs focused — one concern per PR. If you're fixing a bug, add a test.
 
 ## Questions?
 
-Open a [discussion](https://github.com/Perseus-Computing-LLC/mneme/discussions) or file an
+Open a [discussion](https://github.com/Perseus-Computing-LLC/perseus-vault/discussions) or file an
 issue with the `question` label.

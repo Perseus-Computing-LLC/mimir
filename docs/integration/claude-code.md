@@ -1,19 +1,19 @@
-# Integrating Mneme with Claude Code
+# Integrating Perseus Vault with Claude Code
 
 Claude Code is Anthropic's CLI coding agent. It supports custom MCP servers
-via configuration, allowing Mneme to serve as persistent long-term memory
+via configuration, allowing Perseus Vault to serve as persistent long-term memory
 across coding sessions.
 
 ## Quick Start
 
-### 1. Install Mneme
+### 1. Install Perseus Vault
 
 ```bash
 # One-shot bootstrap (recommended)
-curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash
+curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/bootstrap.sh | bash
 
 # Or build from source via cargo
-cargo install --git https://github.com/Perseus-Computing-LLC/mneme
+cargo install --git https://github.com/Perseus-Computing-LLC/perseus-vault
 ```
 
 Verify:
@@ -65,10 +65,10 @@ claude
 
 Ask:
 
-> List your available tools. Do you have access to Mneme tools?
+> List your available tools. Do you have access to Perseus Vault tools?
 
 You should see `mimir_remember`, `mimir_recall`, `mimir_context`, and other
-Mneme tools in the tool list.
+Perseus Vault tools in the tool list.
 
 ## Usage Patterns
 
@@ -100,7 +100,7 @@ Claude Code will call `mimir_journal` to append a structured event.
 
 ## Troubleshooting
 
-### Mneme tools don't appear
+### Perseus Vault tools don't appear
 
 1. **Absolute paths:** Ensure the `--db` argument uses a full absolute path.
    `/home/user/.mimir/data/mimir.db` not `~/.mimir/data/mimir.db`.
@@ -121,9 +121,9 @@ chmod 755 ~/.mimir/data
 chmod 644 ~/.mimir/data/mimir.db
 ```
 
-### Mneme exits immediately
+### Perseus Vault exits immediately
 
-Run Mneme manually to check for startup errors:
+Run Perseus Vault manually to check for startup errors:
 
 ```bash
 mimir --db ~/.mimir/data/mimir.db
@@ -137,7 +137,7 @@ mimir --db ~/.mimir/data/mimir.db
 ### Multiple Claude Code instances
 
 SQLite WAL mode supports concurrent readers. If you see "database is locked",
-another process has an exclusive lock. Kill orphaned Mneme processes:
+another process has an exclusive lock. Kill orphaned Perseus Vault processes:
 
 ```bash
 ps aux | grep '[m]imir'
@@ -163,7 +163,7 @@ This keeps project memories isolated.
 
 ### Web dashboard
 
-Mneme includes an optional web dashboard for browsing entities:
+Perseus Vault includes an optional web dashboard for browsing entities:
 
 ```bash
 mimir --db ~/.mimir/data/mimir.db --web --port 8767

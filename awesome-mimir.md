@@ -1,7 +1,7 @@
-# Awesome Mneme
+# Awesome Perseus Vault
 
-> Curated list of Mneme integrations, tools, and resources.
-> Mneme is an MCP-native, local-first persistent memory engine for AI agents.
+> Curated list of Perseus Vault integrations, tools, and resources.
+> Perseus Vault is an MCP-native, local-first persistent memory engine for AI agents.
 
 ## Contents
 
@@ -15,32 +15,32 @@
 
 ## Official Resources
 
-- [Mneme GitHub Repo](https://github.com/Perseus-Computing-LLC/mneme) — The Mneme source
-- [Roadmap](https://github.com/Perseus-Computing-LLC/mneme/blob/main/ROADMAP.md)
-- [Contributing Guide](https://github.com/Perseus-Computing-LLC/mneme/blob/main/CONTRIBUTING.md)
-- [Security Policy](https://github.com/Perseus-Computing-LLC/mneme/blob/main/SECURITY.md)
+- [Perseus Vault GitHub Repo](https://github.com/Perseus-Computing-LLC/perseus-vault) — The Perseus Vault source
+- [Roadmap](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/ROADMAP.md)
+- [Contributing Guide](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/CONTRIBUTING.md)
+- [Security Policy](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/SECURITY.md)
 
 ## Framework Integrations
 
-Mneme adapters for popular AI agent frameworks:
+Perseus Vault adapters for popular AI agent frameworks:
 
 ### LangGraph (LangChain)
-- [mimir-langgraph](https://github.com/Perseus-Computing-LLC/mneme/tree/main/integrations/langgraph) — `MimirStore` implementing `BaseStore`
+- [mimir-langgraph](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/langgraph) — `MimirStore` implementing `BaseStore`
 - Drop-in persistent memory for LangGraph agents
 - `pip install -e integrations/langgraph/`
 
 ### CrewAI
-- [mimir-crewai](https://github.com/Perseus-Computing-LLC/mneme/tree/main/integrations/crewai) — `MimirMemoryTool` as a CrewAI agent tool
+- [mimir-crewai](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/crewai) — `MimirMemoryTool` as a CrewAI agent tool
 - Agents can remember, recall, journal, and get context
 - `pip install -e integrations/crewai/`
 
 ### AutoGen (AG2 / autogen-core)
-- [mimir-autogen](https://github.com/Perseus-Computing-LLC/mneme/tree/main/integrations/autogen) — `MimirMemory` implementing `autogen_core.memory.Memory`
+- [mimir-autogen](https://github.com/Perseus-Computing-LLC/perseus-vault/tree/main/integrations/autogen) — `MimirMemory` implementing `autogen_core.memory.Memory`
 - Context injection before each inference turn
 - `pip install -e integrations/autogen/`
 
 ### Other Frameworks
-Mneme is MCP-native — any framework with MCP support can use Mneme directly:
+Perseus Vault is MCP-native — any framework with MCP support can use Perseus Vault directly:
 - [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) — via MCP stdio
 - [Google ADK](https://github.com/google/adk-python) — via MCP stdio
 - [Agno](https://github.com/agno-agi/agno) — via MCP stdio
@@ -48,7 +48,7 @@ Mneme is MCP-native — any framework with MCP support can use Mneme directly:
 
 ## MCP Hosts
 
-Mneme works with any MCP host. Configuration is one line:
+Perseus Vault works with any MCP host. Configuration is one line:
 
 ```json
 {
@@ -62,8 +62,8 @@ Mneme works with any MCP host. Configuration is one line:
 ```
 
 Tested and confirmed working with:
-- [Claude Desktop](https://claude.ai/download) — [config guide](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/integration/claude-code.md)
-- [Cursor](https://cursor.com) — [config guide](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/integration/cursor.md)
+- [Claude Desktop](https://claude.ai/download) — [config guide](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/integration/claude-code.md)
+- [Cursor](https://cursor.com) — [config guide](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/integration/cursor.md)
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent)
 - [Perseus](https://perseus.observer) — native integration
 - [OpenClaw](https://openclaw.ai)
@@ -71,7 +71,7 @@ Tested and confirmed working with:
 
 ## Tools & Plugins
 
-### Mneme Itself (36 MCP Tools)
+### Perseus Vault Itself (36 MCP Tools)
 
 | Category | Tools |
 |---|---|
@@ -88,28 +88,28 @@ Tested and confirmed working with:
 
 ### Plugin Ecosystem
 
-- [hermes-mimir-plugin](https://github.com/Perseus-Computing-LLC/hermes-mimir-plugin) — Native Mneme integration for Hermes Agent
-- [Perseus Mneme Connector](https://github.com/Perseus-Computing-LLC/perseus) — Perseus live context injection from Mneme
+- [hermes-mimir-plugin](https://github.com/Perseus-Computing-LLC/hermes-mimir-plugin) — Native Perseus Vault integration for Hermes Agent
+- [Perseus Perseus Vault Connector](https://github.com/Perseus-Computing-LLC/perseus) — Perseus live context injection from Perseus Vault
 
 ## Community Projects
 
-*Add your project here! Open a PR to [awesome-mimir.md](https://github.com/Perseus-Computing-LLC/mneme/blob/main/awesome-mimir.md).*
+*Add your project here! Open a PR to [awesome-mimir.md](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/awesome-mimir.md).*
 
 ## Articles & Tutorials
 
-*Add articles, blog posts, and tutorials about Mneme.*
+*Add articles, blog posts, and tutorials about Perseus Vault.*
 
 ## Comparisons
 
-- [Mneme vs Mem0](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-mem0.md) — Local-first vs cloud-only
-- [Mneme vs Letta](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-letta.md) — Memory engine vs agent runtime
-- [Mneme vs Zep](https://github.com/Perseus-Computing-LLC/mneme/blob/main/docs/comparison/mimir-vs-zep.md) — Single binary vs infrastructure
+- [Perseus Vault vs Mem0](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/mimir-vs-mem0.md) — Local-first vs cloud-only
+- [Perseus Vault vs Letta](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/mimir-vs-letta.md) — Memory engine vs agent runtime
+- [Perseus Vault vs Zep](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/docs/comparison/mimir-vs-zep.md) — Single binary vs infrastructure
 
 ## Key Differentiators
 
-Why Mneme stands out:
+Why Perseus Vault stands out:
 
-| Feature | Mneme | Mem0 | Letta | Zep |
+| Feature | Perseus Vault | Mem0 | Letta | Zep |
 |---|---|---|---|---|
 | **MCP-Native** | ✅ 36 tools | ❌ | ❌ | ❌ |
 | **Local-First** | ✅ Single binary | ❌ Cloud-dependent | ❌ Docker + Postgres | ❌ Docker + Postgres |
@@ -120,6 +120,6 @@ Why Mneme stands out:
 
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/Perseus-Computing-LLC/mneme/blob/main/CONTRIBUTING.md).
+See [CONTRIBUTING.md](https://github.com/Perseus-Computing-LLC/perseus-vault/blob/main/CONTRIBUTING.md).
 
 To add your project/resource to this list, open a PR against the `awesome-mimir.md` file.

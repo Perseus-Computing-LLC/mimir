@@ -8,12 +8,12 @@ All notable changes to Mimir are documented here. This project adheres to
 ## [2.9.0] - 2026-07-01
 
 ### Changed
-- **Product rename: Mneme → Perseus Vault.** "Mneme" collided with an active
+- **Product rename: Perseus Vault → Perseus Vault.** "Perseus Vault" collided with an active
   commercial competitor (mneme.tools) plus several other unrelated AI-memory
   products and open-source projects already using that exact name — a repeat
   of the earlier Mimir naming collision. The crate and `[[bin]]` are now
   `perseus-vault`; the default database for fresh installs is
-  `~/.mimir/data/perseus-vault.db` (an existing `mneme.db` or `mimir.db` at
+  `~/.mimir/data/perseus-vault.db` (an existing `perseus-vault.db` or `mimir.db` at
   that path is still used automatically, in that fallback order, so upgraders
   keep their data — see `default_db_path()` in `src/main.rs`). Every
   `mimir_*` MCP tool is now additionally registered under a `perseus_vault_*`
@@ -32,7 +32,7 @@ All notable changes to Mimir are documented here. This project adheres to
   own timeline.
 
 ### Breaking (soft — back-compat aliases provided)
-- Fresh installs now default to `perseus-vault.db` instead of `mneme.db`/
+- Fresh installs now default to `perseus-vault.db` instead of `perseus-vault.db`/
   `mimir.db`. Existing databases at the old paths are auto-detected and used
   as-is (no migration needed), but new installs on a machine with no prior
   database will create the new filename. Set `--db`/`MIMIR_DB_PATH`
@@ -41,10 +41,10 @@ All notable changes to Mimir are documented here. This project adheres to
 ## [2.8.0] - 2026-06-30
 
 ### Changed
-- **Product rename: Mimir → Mneme.** Avoids a trademark/SEO collision with
+- **Product rename: Mimir → Perseus Vault.** Avoids a trademark/SEO collision with
   Grafana Mimir and a same-niche competitor also named Mimir. The crate and
   `[[bin]]` are now `mneme`; the default database for fresh installs is
-  `~/.mimir/data/mneme.db` (an existing `mimir.db` at that path is still used
+  `~/.mimir/data/perseus-vault.db` (an existing `mimir.db` at that path is still used
   automatically, so upgraders keep their data — see `default_db_path()` in
   `src/main.rs`). Every `mimir_*` MCP tool is now also registered under the
   equivalent `mneme_*` name — both dispatch to the same handler, so existing
@@ -52,7 +52,7 @@ All notable changes to Mimir are documented here. This project adheres to
   unchanged during the transition. `mimir doctor`/`--help` output now refers to
   the `mneme` binary. Internal-only Rust identifiers (`MimirGrpcServer`, the
   optional `grpc` feature's generated `Mimir`/`MimirServer` proto types) are
-  renamed to their `Mneme` equivalents with no back-compat surface, since
+  renamed to their `Perseus Vault` equivalents with no back-compat surface, since
   nothing outside the binary depends on them.
 
 ### Fixed
@@ -309,5 +309,5 @@ search works with zero config and zero network by default.
   semantic-search claim on every platform a developer runs. Added a `lite-build`
   job guarding `--no-default-features`.
 
-[2.2.1]: https://github.com/Perseus-Computing-LLC/mneme/compare/v2.2.0...v2.2.1
-[2.2.0]: https://github.com/Perseus-Computing-LLC/mneme/compare/v2.1.0...v2.2.0
+[2.2.1]: https://github.com/Perseus-Computing-LLC/perseus-vault/compare/v2.2.0...v2.2.1
+[2.2.0]: https://github.com/Perseus-Computing-LLC/perseus-vault/compare/v2.1.0...v2.2.0

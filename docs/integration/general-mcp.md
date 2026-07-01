@@ -1,12 +1,12 @@
 # General MCP Integration Guide
 
-Mneme is an MCP stdio server. It works with **any** MCP-compatible client.
+Perseus Vault is an MCP stdio server. It works with **any** MCP-compatible client.
 
 ## Bootstrap (60 seconds)
 
 ```bash
-# Install Mneme
-curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash
+# Install Perseus Vault
+curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/bootstrap.sh | bash
 
 # Create data directory
 mkdir -p ~/.mimir/data
@@ -97,7 +97,7 @@ mcp_servers:
 
 ## Encryption
 
-Mneme supports AES-256-GCM encryption at rest for `body_json`. Opt-in:
+Perseus Vault supports AES-256-GCM encryption at rest for `body_json`. Opt-in:
 
 ```bash
 # Generate key
@@ -110,10 +110,10 @@ mimir keygen --key-file ~/.mimir/secret.key
 ## Docker
 
 ```bash
-docker run -v ~/.mimir/data:/data ghcr.io/Perseus-Computing-LLC/mneme:latest --db /data/mimir.db
+docker run -v ~/.mimir/data:/data ghcr.io/Perseus-Computing-LLC/perseus-vault:latest --db /data/perseus-vault.db
 ```
 
-## What Mneme Is Not
+## What Perseus Vault Is Not
 
 - ❌ Not a vector database — it's a persistent memory engine
 - ❌ Not a cloud service — everything runs locally
@@ -122,4 +122,4 @@ docker run -v ~/.mimir/data:/data ghcr.io/Perseus-Computing-LLC/mneme:latest --d
 
 ## Design Philosophy
 
-> Mneme is memory for machines. It remembers what your agents learn so they don't start cold every session. Everything is stored locally, searchable via FTS5 + hybrid search, and exportable as plain Markdown files. No API keys, no cloud dependencies, no vendor lock-in.
+> Perseus Vault is memory for machines. It remembers what your agents learn so they don't start cold every session. Everything is stored locally, searchable via FTS5 + hybrid search, and exportable as plain Markdown files. No API keys, no cloud dependencies, no vendor lock-in.

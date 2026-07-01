@@ -1,6 +1,6 @@
-# Mneme CrewAI Integration
+# Perseus Vault CrewAI Integration
 
-Persistent memory for CrewAI agents via Mneme.
+Persistent memory for CrewAI agents via Perseus Vault.
 
 ## Install
 
@@ -35,7 +35,7 @@ researcher = Agent(
 task = Task(
     description=(
         "Research the competitor's pricing strategy. "
-        "Use Mneme Memory to recall any previous findings on this topic, "
+        "Use Perseus Vault Memory to recall any previous findings on this topic, "
         "then remember your new conclusions."
     ),
     agent=researcher,
@@ -57,7 +57,7 @@ result = crew.kickoff()
 
 ## How It Works
 
-The `MimirMemoryTool` wraps Mneme's MCP tools as a CrewAI tool:
+The `MimirMemoryTool` wraps Perseus Vault's MCP tools as a CrewAI tool:
 
 - `remember` → `mimir_remember`
 - `recall` → `mimir_recall`
@@ -69,6 +69,6 @@ a shared knowledge base over time.
 
 ## Requirements
 
-- Mneme v1.0.0+ (`curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash`)
+- Perseus Vault v1.0.0+ (`curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/bootstrap.sh | bash`)
 - CrewAI >= 0.30.0
 - Python 3.10+

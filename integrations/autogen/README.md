@@ -1,7 +1,7 @@
-# Mneme for AutoGen
+# Perseus Vault for AutoGen
 
 Persistent long-term memory for [AutoGen](https://github.com/microsoft/autogen)
-(AG2 / `autogen-core` v0.4+) agents, backed by [Mneme](https://github.com/Perseus-Computing-LLC/mneme).
+(AG2 / `autogen-core` v0.4+) agents, backed by [Perseus Vault](https://github.com/Perseus-Computing-LLC/perseus-vault).
 
 `MimirMemory` implements the `autogen_core.memory.Memory` protocol, so it drops
 straight into an `AssistantAgent(memory=[...])`. Stored knowledge is injected
@@ -11,8 +11,8 @@ survives across sessions, processes, and crews.
 ## Install
 
 ```bash
-# Install Mneme (the binary)
-curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/mneme/main/scripts/bootstrap.sh | bash
+# Install Perseus Vault (the binary)
+curl -sSL https://raw.githubusercontent.com/Perseus-Computing-LLC/perseus-vault/main/scripts/bootstrap.sh | bash
 
 # Install the adapter
 pip install -e integrations/autogen
@@ -53,9 +53,9 @@ async def main():
 asyncio.run(main())
 ```
 
-## How it maps to Mneme
+## How it maps to Perseus Vault
 
-| AutoGen `Memory` method | Mneme tool | Behavior |
+| AutoGen `Memory` method | Perseus Vault tool | Behavior |
 |---|---|---|
 | `add(MemoryContent)` | `mimir_remember` | Content → `body_json`; `metadata.category`/`metadata.key` route the entity |
 | `query(text)` | `mimir_recall` | FTS5 keyword search → list of `MemoryContent` |

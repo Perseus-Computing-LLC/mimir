@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/mimir",
-  "title": "Mneme (formerly Mimir), persistent memory engine for AI agents",
+  "title": "Perseus Vault (formerly Mimir/Mneme), persistent memory engine for AI agents",
   "description": "Local-first MCP memory server: SQLite, FTS5 and vector search, AES-256-GCM. 46 tools, no cloud.",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "packages": [{
     "registryType": "oci",
-    "identifier": "ghcr.io/perseus-computing-llc/mneme:2.8.0",
+    "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.9.0",
     "transport": {"type": "stdio"},
     "runtimeHint": "docker",
     "runtimeArguments": [
@@ -17,12 +17,12 @@
     "packageArguments": [
       {"type": "positional", "value": "serve"},
       {"type": "positional", "value": "--db"},
-      {"type": "positional", "value": "/data/mneme.db"}
+      {"type": "positional", "value": "/data/perseus-vault.db"}
     ]
   }],
-  "websiteUrl": "https://github.com/Perseus-Computing-LLC/mneme",
+  "websiteUrl": "https://github.com/Perseus-Computing-LLC/perseus-vault",
   "repository": {
     "source": "github",
-    "url": "https://github.com/Perseus-Computing-LLC/mneme"
+    "url": "https://github.com/Perseus-Computing-LLC/perseus-vault"
   }
 }
