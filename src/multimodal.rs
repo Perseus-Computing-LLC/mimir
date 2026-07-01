@@ -142,8 +142,13 @@ pub fn docx_xml_to_text(xml: &str) -> String {
                 tag.push(tc);
             }
             let name = tag.trim_start_matches('/').trim();
-            // Match the element name irrespective of attributes.
-            let elem = name.split_whitespace().next().unwrap_or("");
+            // Match the element name irrespective of attributes. A bare
+            // self-closing tag with no attributes (e.g. `<w:tab/>`, which is
+            // exactly what real Word documents emit for tab stops and manual
+            // line breaks) has no whitespace before the `/`, so split on
+            // whitespace alone would yield "w:tab/" and never match "w:tab"
+            // below — strip a trailing '/' too.
+            let elem = name.split_whitespace().next().unwrap_or("").trim_end_matches('/');
             if elem == "w:t" {
                 capture = !tag.starts_with('/');
             } else if tag.starts_with('/') && elem == "w:p" {
@@ -238,6 +243,24 @@ mod tests {
     fn docx_ignores_non_text_tags() {
         let xml = "<w:p><w:pPr><w:spacing/></w:pPr><w:r><w:t>kept</w:t></w:r></w:p>";
         assert_eq!(docx_xml_to_text(xml), "kept");
+    }
+
+    #[test]
+    fn docx_bare_self_closing_tab_and_br_are_not_dropped() {
+        // Bare (no-attribute) self-closing <w:tab/> and <w:br/> are exactly what
+        // real Word documents emit for tab stops and manual line breaks — the
+        // tag name previously retained the trailing '/' and never matched
+        // "w:tab"/"w:br", silently concatenating the neighboring runs together.
+        let xml = "<w:p><w:r><w:t>Col1</w:t><w:tab/><w:t>Col2</w:t></w:r></w:p>";
+        assert_eq!(docx_xml_to_text(xml), "Col1\tCol2");
+
+        let xml = "<w:p><w:r><w:t>Line1</w:t><w:br/><w:t>Line2</w:t></w:r></w:p>";
+        assert_eq!(docx_xml_to_text(xml), "Line1\nLine2");
+
+        // Self-closing WITH attributes already worked (whitespace precedes the
+        // '/'); keep it covered so a future change can't regress it silently.
+        let xml = "<w:p><w:r><w:t>A</w:t><w:tab w:val=\"left\" w:pos=\"720\"/><w:t>B</w:t></w:r></w:p>";
+        assert_eq!(docx_xml_to_text(xml), "A\tB");
     }
 
     #[cfg(not(feature = "multimodal"))]
