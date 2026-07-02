@@ -198,11 +198,19 @@ impl Database {
                         .map_err(|e| {
                             format!("rekey_aad: re-encrypt failed for {}:{}: {}", category, key, e)
                         })?;
-                    conn.execute(
-                        "UPDATE entities SET body_json = ?1 WHERE rowid = ?2",
-                        params![new_cipher, rowid],
-                    )?;
-                    migrated += 1;
+                    if Self::rekey_write_guarded(&conn, rowid, &new_cipher, &raw_body)? {
+                        migrated += 1;
+                    } else {
+                        // #386: the row was rewritten (a concurrent remember)
+                        // between our read and this write. The new body was
+                        // written under the current AAD — do NOT revert it to
+                        // the re-encrypted stale snapshot.
+                        eprintln!(
+                            "mimir: rekey_aad skipped {}:{} — row changed during migration (already current)",
+                            category, key
+                        );
+                        already_current += 1;
+                    }
                 }
                 _ => {
                     eprintln!(
@@ -214,6 +222,25 @@ impl Database {
             }
         }
         Ok((migrated, already_current, failed))
+    }
+
+    /// #386: rekey_aad's per-row write, guarded against a concurrent rewrite.
+    /// The UPDATE only lands if the stored ciphertext still equals the one we
+    /// read and re-encrypted — otherwise a `remember()` that committed in the
+    /// window would be silently reverted to stale content (with a valid
+    /// ciphertext, so nothing would ever flag it). Returns whether the write
+    /// landed. No lock is held across the decrypt/encrypt CPU work.
+    fn rekey_write_guarded(
+        conn: &rusqlite::Connection,
+        rowid: i64,
+        new_cipher: &str,
+        old_cipher: &str,
+    ) -> Result<bool, rusqlite::Error> {
+        let changed = conn.execute(
+            "UPDATE entities SET body_json = ?1 WHERE rowid = ?2 AND body_json = ?3",
+            params![new_cipher, rowid, old_cipher],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Open a database at `path`, initializing the v0.2.0 schema if needed.
@@ -4238,8 +4265,14 @@ impl Database {
         followed: bool,
     ) -> Result<crate::models::FollowReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        // #385: read-decide-write — the counts must be read under the writer
+        // lock, or two concurrent follow() calls both read the same base and
+        // one increment is lost (with follow_rate/efficacy_status derived
+        // from the stale counts). Fifth instance of the #377/#379/#381/#382
+        // family; the not-found early return drops the tx (rollback).
+        let tx = Self::audited_write_tx(&conn)?;
 
-        let existing: Option<(i64, i64)> = conn
+        let existing: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT follow_count, miss_count FROM entities WHERE category = ?1 AND key = ?2 AND archived = 0",
                 params![category, key],
@@ -4288,7 +4321,7 @@ impl Database {
         }
         .to_string();
 
-        conn.execute(
+        tx.execute(
             "UPDATE entities SET follow_count = ?1, miss_count = ?2, follow_rate = ?3, \
              efficacy_status = ?4 WHERE category = ?5 AND key = ?6",
             params![
@@ -4300,6 +4333,7 @@ impl Database {
                 key
             ],
         )?;
+        tx.commit()?;
 
         Ok(crate::models::FollowReport {
             found: true,
@@ -5181,7 +5215,7 @@ Return a JSON object with an "insights" array. Each insight has:
               source, always_on, certainty, workspace_hash, agent_id, visibility,
               valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms, invalidated_at_unix_ms,
               supersedes, superseded_by, created_at_unix_ms, last_accessed_unix_ms)
-             SELECT ?1, id, category, key, body_json, status, type, tags, decay_score,
+             SELECT ?1, id, category, key, body_json, COALESCE(status, 'active'), type, tags, decay_score,
               retrieval_count, layer, topic_path, archived, archive_reason, links, verified,
               source, always_on, certainty, workspace_hash, agent_id, visibility,
               valid_from_unix_ms, valid_to_unix_ms, recorded_at_unix_ms,
@@ -10630,6 +10664,52 @@ mod tests {
     }
 
     #[test]
+    fn rekey_write_guarded_skips_concurrently_changed_row() {
+        // #386: rekey_aad reads a row, re-encrypts off-lock, then writes. If
+        // a remember() rewrote the body in that window, the guarded write
+        // must NOT land — it would silently revert the entity to stale
+        // content under a valid ciphertext. The guard is the
+        // `AND body_json = ?old` predicate.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-386", "facts", "k386", r#"{"n":"v1"}"#))
+            .unwrap();
+        let conn = db.conn().unwrap();
+        let (rowid, body_at_read): (i64, String) = conn
+            .query_row(
+                "SELECT rowid, body_json FROM entities WHERE id = 'e-386'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        // Concurrent rewrite lands between rekey's read and its write.
+        conn.execute(
+            "UPDATE entities SET body_json = '{\"n\":\"v2\"}' WHERE id = 'e-386'",
+            [],
+        )
+        .unwrap();
+
+        // The guarded write (stale old cipher) must be a no-op…
+        let landed =
+            Database::rekey_write_guarded(&conn, rowid, "stale-reencrypt", &body_at_read).unwrap();
+        assert!(!landed, "guarded write must skip a concurrently changed row");
+        let body_now: String = conn
+            .query_row("SELECT body_json FROM entities WHERE id = 'e-386'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body_now, r#"{"n":"v2"}"#, "newer content must survive");
+
+        // …and land normally when the row is unchanged.
+        let landed =
+            Database::rekey_write_guarded(&conn, rowid, "fresh-reencrypt", &body_now).unwrap();
+        assert!(landed);
+        let body_final: String = conn
+            .query_row("SELECT body_json FROM entities WHERE id = 'e-386'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body_final, "fresh-reencrypt");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn rekey_aad_migrates_legacy_rows_and_is_idempotent() {
         use crate::encryption::EncryptionManager;
         use std::io::Write;
@@ -12932,6 +13012,86 @@ mod tests {
         let missing = db.follow("convention", "does-not-exist", true).unwrap();
         assert!(!missing.found);
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_follows_do_not_lose_increments() {
+        // #385: follow() is read-decide-write — before the writer lock, two
+        // concurrent calls could both read the same counts and one increment
+        // was silently lost (and follow_rate/efficacy_status derived from
+        // stale counts). N threads x M follows must land exactly N*M.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "f-385",
+            "convention",
+            "hot-rule",
+            r#"{"rule":"raced"}"#,
+        ))
+        .unwrap();
+
+        const THREADS: usize = 4;
+        const CALLS: usize = 10;
+        let db = Arc::new(db);
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                thread::spawn(move || {
+                    for _ in 0..CALLS {
+                        db.follow("convention", "hot-rule", true).expect("follow");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let conn = db.conn().unwrap();
+        let (follows, rate): (i64, f64) = conn
+            .query_row(
+                "SELECT follow_count, follow_rate FROM entities WHERE id = 'f-385'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            follows,
+            (THREADS * CALLS) as i64,
+            "lost follow increments under concurrency"
+        );
+        assert!((rate - 1.0).abs() < 1e-9, "follow_rate must be 1.0, got {rate}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_union_stored_link_wins_on_same_target() {
+        // #382 review advisory: pin the union's conflict rule — when the
+        // caller re-asserts a link to a target that already has a stored
+        // edge, the STORED relationship/weight win (link() is the editing
+        // path; remember must not silently rewrite edge metadata).
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-swin", "facts", "swin-src", r#"{"n":"v1"}"#))
+            .unwrap();
+        db.remember_skip_dedup(&make_entity("e-swin-t", "facts", "swin-tgt", r#"{"n":"t"}"#))
+            .unwrap();
+        db.link("facts", "swin-src", "e-swin-t", "related").unwrap();
+
+        let mut e = make_entity("ignored", "facts", "swin-src", r#"{"n":"v2"}"#);
+        e.links.push(MemoryLink {
+            target_id: "e-swin-t".to_string(),
+            relationship: "caused-by".to_string(),
+            weight: 0.99,
+        });
+        db.remember(&e).unwrap();
+
+        let live = db.get_entity("facts", "swin-src").unwrap().unwrap();
+        assert_eq!(live.links.len(), 1, "no duplicate edge for the same target");
+        assert_eq!(live.links[0].relationship, "related", "stored edge wins");
+        assert!((live.links[0].weight - 0.5).abs() < 1e-9, "stored weight wins");
         let _ = fs::remove_file(&path);
     }
 
