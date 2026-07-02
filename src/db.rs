@@ -60,6 +60,71 @@ impl EmbeddingCache {
     }
 }
 
+/// #393: default bound for the background auto-embed queue. Each queued job
+/// holds the entity id + plaintext body (~1KB typical), so 1024 caps queue
+/// memory at roughly a megabyte. Overflow policy is drop-new (see
+/// `enqueue_auto_embed`): auto-embedding is best-effort by contract, and a
+/// dropped row is recoverable via `mimir_embed` batch mode (which embeds rows
+/// `WHERE embedding IS NULL`) or the row's next content change.
+const EMBED_QUEUE_CAP: usize = 1024;
+
+/// #393: max jobs the worker drains per wake. The win is the drain loop (one
+/// thread wake + one pooled-connection draw per store, amortized model-cache
+/// hits), not tensor batching — per-item ONNX calls hit the #208/#219 cached
+/// session.
+const EMBED_BATCH_MAX: usize = 32;
+
+/// One deferred auto-embed request (#393). `plaintext` doubles as the embed
+/// input and the stale-guard comparand: the worker only stores the vector if
+/// the entity's CURRENT plaintext (via its FTS row) still equals it.
+struct EmbedJob {
+    id: String,
+    plaintext: String,
+}
+
+/// #393: handle to the background auto-embed worker owned by `Database`.
+/// Spawned lazily on the first content-changing write that needs an embedding
+/// (by then serve-time configuration — set_llm / set_embedding_model, which
+/// take `&mut self` — has been applied; later config changes do not propagate
+/// to the worker).
+struct EmbedWorker {
+    tx: std::sync::mpsc::SyncSender<EmbedJob>,
+    /// Set by Drop: the worker skips remaining queued jobs and exits after the
+    /// in-flight one finishes.
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Count of enqueued-but-not-finished jobs; the condvar wakes
+    /// `embed_queue_flush` waiters when it reaches zero.
+    pending: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    /// The worker sends () as its final action, so Drop can bound its wait
+    /// (std has no timed join). Mutex only for Sync — Drop is the sole reader.
+    done_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// #393: emit `msg` on stderr at most once per 60s per `site`. A misconfigured
+/// embedding backend (enabled, model missing, no endpoint) previously logged
+/// one eprintln per write; suppressed occurrences are simply dropped — the
+/// condition is steady-state, so one reminder a minute carries the signal.
+fn rate_limited_log(site: &'static str, msg: &str) {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    static LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, Instant>>> =
+        std::sync::OnceLock::new();
+    let map = LAST.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = match map.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let now = Instant::now();
+    match map.get(site) {
+        Some(t) if now.duration_since(*t) < Duration::from_secs(60) => {}
+        _ => {
+            map.insert(site, now);
+            eprintln!("{}", msg);
+        }
+    }
+}
+
 pub struct Database {
     pool: r2d2::Pool<SqliteConnectionManager>,
     db_path: String,
@@ -69,6 +134,11 @@ pub struct Database {
     embedding_config: crate::embedding::EmbeddingConfig,
     embedding_cache: std::sync::Mutex<EmbeddingCache>,
     connectors: Vec<Box<dyn Connector>>,
+    /// #393: lazily spawned background auto-embed worker (see `EmbedWorker`).
+    embed_worker: std::sync::OnceLock<EmbedWorker>,
+    /// #393: bound of the auto-embed queue; `EMBED_QUEUE_CAP` unless a test
+    /// shrinks it to exercise the overflow path.
+    embed_queue_cap: usize,
 }
 
 /// Configuration for the LLM integration (Ollama or OpenAI-compatible API).
@@ -301,6 +371,8 @@ impl Database {
             embedding_config: crate::embedding::EmbeddingConfig::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(256)),
             connectors: Vec::new(),
+            embed_worker: std::sync::OnceLock::new(),
+            embed_queue_cap: EMBED_QUEUE_CAP,
         })
     }
 
@@ -660,6 +732,220 @@ impl Database {
         Ok(())
     }
 
+    /// #393: store a deferred auto-embed result ONLY if the entity's current
+    /// plaintext body still equals the text the vector was computed from —
+    /// the writer-family rule (#377/#379/#381): no read-decide-write on stale
+    /// data. The comparison rides inside the UPDATE itself (single atomic
+    /// statement, same shape as #386's rekey_write_guarded), against the FTS
+    /// row — which stores the PLAINTEXT body and is kept transactionally in
+    /// sync by every body writer — because `entities.body_json` may be GCM
+    /// ciphertext that changes on every write even for identical plaintext.
+    /// A missing FTS row (entity forgotten since enqueue) makes the guard
+    /// fail, which is the correct outcome. Returns whether the write landed;
+    /// a skip is fine by the auto-embed contract — the newer body enqueued
+    /// its own job.
+    fn store_embedding_guarded_with_conn(
+        conn: &rusqlite::Connection,
+        id: &str,
+        plaintext: &str,
+        embedding: &[f32],
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let sig = embedding_signature(embedding);
+        let changed = conn.execute(
+            "UPDATE entities SET embedding = ?1, emb_sig = ?2
+             WHERE id = ?3
+               AND EXISTS (SELECT 1 FROM entities_fts f
+                           WHERE f.rowid = entities.rowid AND f.body_json = ?4)",
+            params![blob, sig, id, plaintext],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// #393: hand (id, plaintext) to the background embed worker instead of
+    /// embedding inline — the inline ONNX call cost every content-changing
+    /// write ~6.7ms (62x). Non-blocking: if the bounded queue is full the job
+    /// is DROPPED (drop-new) with a rate-limited warning; auto-embedding is
+    /// best-effort by contract, and unbounded queue growth is not acceptable.
+    /// A dropped row stays out of dense search until its next content change
+    /// or an explicit `mimir_embed` batch pass (`WHERE embedding IS NULL`).
+    fn enqueue_auto_embed(&self, id: &str, plaintext: &str) {
+        let worker = self.embed_worker.get_or_init(|| {
+            Self::spawn_embed_worker(
+                self.pool.clone(),
+                self.embedding_config.clone(),
+                self.llm_config.clone(),
+                self.embed_queue_cap,
+            )
+        });
+
+        // Count the job BEFORE sending: the worker decrements when it finishes,
+        // and incrementing after a send could race a fast worker into a
+        // decrement-before-increment underflow.
+        {
+            let (lock, _) = &*worker.pending;
+            if let Ok(mut n) = lock.lock() {
+                *n += 1;
+            }
+        }
+        let job = EmbedJob {
+            id: id.to_string(),
+            plaintext: plaintext.to_string(),
+        };
+        if worker.tx.try_send(job).is_err() {
+            // Queue full (or worker gone): drop-new. Roll the count back so
+            // flush waiters don't hang on a job that will never run.
+            let (lock, cvar) = &*worker.pending;
+            if let Ok(mut n) = lock.lock() {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    cvar.notify_all();
+                }
+            }
+            rate_limited_log(
+                "embed-queue-overflow",
+                "mimir: auto-embed queue full — dropping newest job(s); rows stay \
+                 unembedded until their next change or a mimir_embed batch pass",
+            );
+        }
+    }
+
+    /// #393: spawn the background auto-embed worker. It drains up to
+    /// `EMBED_BATCH_MAX` queued jobs per wake; per job it generates the
+    /// embedding first (no connection held during ONNX/HTTP work), then draws
+    /// one pooled connection for the guarded store — the #397 discipline: never
+    /// more than one pool draw at a time, never held across slow work.
+    fn spawn_embed_worker(
+        pool: r2d2::Pool<SqliteConnectionManager>,
+        embedding_config: crate::embedding::EmbeddingConfig,
+        llm_config: LlmConfig,
+        queue_cap: usize,
+    ) -> EmbedWorker {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EmbedJob>(queue_cap);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new((Mutex::new(0u64), Condvar::new()));
+
+        let w_shutdown = Arc::clone(&shutdown);
+        let w_pending = Arc::clone(&pending);
+        let handle = std::thread::Builder::new()
+            .name("mimir-embed-worker".to_string())
+            .spawn(move || {
+                // recv() keeps yielding buffered jobs after the sender drops, so
+                // a shutdown drains the remainder through the skip branch below
+                // (fast) before recv() finally errors and the loop exits.
+                while let Ok(first) = rx.recv() {
+                    let mut batch = vec![first];
+                    while batch.len() < EMBED_BATCH_MAX {
+                        match rx.try_recv() {
+                            Ok(job) => batch.push(job),
+                            Err(_) => break,
+                        }
+                    }
+                    for job in batch {
+                        if !w_shutdown.load(Ordering::SeqCst) {
+                            match Self::generate_embedding_backend(
+                                &embedding_config,
+                                &llm_config,
+                                &job.plaintext,
+                            ) {
+                                Ok(vec) => match pool.get() {
+                                    Ok(conn) => {
+                                        if let Err(e) = Self::store_embedding_guarded_with_conn(
+                                            &conn,
+                                            &job.id,
+                                            &job.plaintext,
+                                            &vec,
+                                        ) {
+                                            rate_limited_log(
+                                                "embed-store",
+                                                &format!(
+                                                    "mimir: auto-embed store failed for {}: {}",
+                                                    job.id, e
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => rate_limited_log(
+                                        "embed-pool",
+                                        &format!(
+                                            "mimir: auto-embed skipped {} — no pooled connection: {}",
+                                            job.id, e
+                                        ),
+                                    ),
+                                },
+                                Err(e) => rate_limited_log(
+                                    "embed-generate",
+                                    &format!(
+                                        "mimir: auto-embed generation failed for {}: {}",
+                                        job.id, e
+                                    ),
+                                ),
+                            }
+                        }
+                        // Finished (or shutdown-skipped): wake flush waiters.
+                        let (lock, cvar) = &*w_pending;
+                        if let Ok(mut n) = lock.lock() {
+                            *n = n.saturating_sub(1);
+                            if *n == 0 {
+                                cvar.notify_all();
+                            }
+                        }
+                    }
+                }
+                let _ = done_tx.send(());
+            })
+            .expect("spawn mimir-embed-worker");
+
+        EmbedWorker {
+            tx,
+            shutdown,
+            pending,
+            done_rx: std::sync::Mutex::new(done_rx),
+            handle,
+        }
+    }
+
+    /// #393: block until every queued auto-embed job has finished (or been
+    /// dropped), bounded by `timeout`. Returns whether the queue drained. A
+    /// determinism seam for tests and callers that need write-then-dense-search
+    /// ordering; production writes never wait on it.
+    #[doc(hidden)]
+    #[allow(dead_code)] // test seam — exercised by the test builds only
+    pub fn embed_queue_flush(&self, timeout: std::time::Duration) -> bool {
+        let Some(worker) = self.embed_worker.get() else {
+            return true; // nothing was ever enqueued
+        };
+        let (lock, cvar) = &*worker.pending;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut n = match lock.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        while *n > 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            n = match cvar.wait_timeout(n, deadline - now) {
+                Ok((g, _)) => g,
+                Err(_) => return false,
+            };
+        }
+        true
+    }
+
+    /// #393 test seam: shrink the auto-embed queue bound to exercise the
+    /// drop-new overflow path. Must be called before the first enqueue (the
+    /// worker reads the cap when it is lazily spawned).
+    #[cfg(test)]
+    fn set_embed_queue_cap(&mut self, cap: usize) {
+        self.embed_queue_cap = cap;
+    }
+
     /// Generate and store embeddings for entities via Ollama /api/embed.
     pub fn embed_entity(
         &self,
@@ -725,6 +1011,13 @@ impl Database {
     /// 1. Local ONNX model (if embedding_config.enabled)
     /// 2. Python onnxruntime subprocess (if available)
     /// 3. Ollama /api/embed or OpenAI /v1/embeddings (if llm_config set)
+    ///
+    /// Consults + fills the #219 session cache — for the SYNCHRONOUS callers
+    /// (query embedding in recall, explicit `mimir_embed`), whose texts repeat.
+    /// The write path does not come through here anymore (#393): new/changed
+    /// bodies are unique by definition, so its lookups were up-to-256 full-body
+    /// string compares that could never hit (and its inserts evicted query
+    /// entries that could).
     fn generate_embedding_with_fallback(
         &self,
         text: &str,
@@ -736,29 +1029,41 @@ impl Database {
             }
         }
 
+        let vec = Self::generate_embedding_backend(&self.embedding_config, &self.llm_config, text)?;
+        // Cache successful embedding
+        if let Ok(mut cache) = self.embedding_cache.lock() {
+            cache.put(text.to_string(), vec.clone());
+        }
+        Ok(vec)
+    }
+
+    /// #393: the backend-fallback chain of `generate_embedding_with_fallback`,
+    /// as an uncached associated fn so the background embed worker (which owns
+    /// config snapshots, not `&Database`) can share it.
+    fn generate_embedding_backend(
+        embedding_config: &crate::embedding::EmbeddingConfig,
+        llm_config: &LlmConfig,
+        text: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         // 1. Local ONNX — if enabled and either the model is compiled in (#237)
         //    or a model file exists on disk.
-        if self.embedding_config.enabled
-            && (self.embedding_config.bundled || self.embedding_config.model_path.exists())
+        if embedding_config.enabled
+            && (embedding_config.bundled || embedding_config.model_path.exists())
         {
-            match crate::embedding::generate_embedding(&self.embedding_config, text) {
-                Ok(vec) => {
-                    // Cache successful embedding
-                    if let Ok(mut cache) = self.embedding_cache.lock() {
-                        cache.put(text.to_string(), vec.clone());
-                    }
-                    return Ok(vec);
-                }
-                Err(e) => eprintln!(
-                    "mimir: local ONNX embedding failed ({}), falling back...",
-                    e
+            match crate::embedding::generate_embedding(embedding_config, text) {
+                Ok(vec) => return Ok(vec),
+                // Rate-limited (#393): a persistently broken local model
+                // otherwise logs once per embedding attempt.
+                Err(e) => rate_limited_log(
+                    "onnx-fallback",
+                    &format!("mimir: local ONNX embedding failed ({}), falling back...", e),
                 ),
             }
         }
 
         // 2. Remote endpoint (Ollama or OpenAI-compatible)
-        if self.llm_config.enabled {
-            return self.call_ollama_embed(text);
+        if llm_config.enabled {
+            return Self::call_ollama_embed(llm_config, text);
         }
 
         Err("No embedding backend available. Set --embedding-model to a local ONNX model, or --llm-endpoint for remote.".into())
@@ -766,21 +1071,23 @@ impl Database {
 
     /// Call embed endpoint to get a dense vector for a text.
     /// Supports both Ollama /api/embed and OpenAI-compatible /v1/embeddings.
-    fn call_ollama_embed(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        if !self.llm_config.enabled {
+    fn call_ollama_embed(
+        llm_config: &LlmConfig,
+        text: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        if !llm_config.enabled {
             return Err("LLM is not enabled. Set --llm-endpoint to use embedding.".into());
         }
         // Determine embedding endpoint: explicit --embedding-endpoint wins,
         // otherwise derive from the LLM endpoint by swapping /api/generate → /api/embed.
-        let endpoint = self
-            .llm_config
+        let endpoint = llm_config
             .embedding_endpoint
             .as_deref()
             .unwrap_or({
                 // Default: replace Ollama generate endpoint with embed
-                self.llm_config.endpoint.as_str()
+                llm_config.endpoint.as_str()
             });
-        let effective_endpoint = if self.llm_config.embedding_endpoint.is_some() {
+        let effective_endpoint = if llm_config.embedding_endpoint.is_some() {
             // Explicit endpoint: use as-is
             endpoint.to_string()
         } else {
@@ -792,15 +1099,15 @@ impl Database {
         let is_openai = effective_endpoint.contains("/v1/");
 
         let body = serde_json::json!({
-            "model": self.llm_config.model,
+            "model": llm_config.model,
             "input": text,
         });
         let body_str = serde_json::to_string(&body)?;
 
         let mut request = ureq::post(&effective_endpoint)
             .set("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(self.llm_config.timeout_secs));
-        if let Some(ref key) = self.llm_config.api_key {
+            .timeout(std::time::Duration::from_secs(llm_config.timeout_secs));
+        if let Some(ref key) = llm_config.api_key {
             request = request.set("Authorization", &format!("Bearer {}", key));
         }
         let response = request
@@ -2238,26 +2545,21 @@ impl Database {
             should_embed = true;
         }
 
-        // #271: synchronous auto-embed on write. Single-entity embedding is
-        // deterministic and LRU-cached, so this is cheap and safe — unlike the
-        // batch path, whose nondeterminism caused the prior regression. We embed
-        // the PLAINTEXT body_json (not the possibly-encrypted column value).
-        // Failures are non-fatal: a missing embedding only means this row won't
-        // surface in dense/hybrid search until it is embedded later. Gated on the
-        // content-changed signal so identical re-asserts skip the recompute.
+        // #271/#393: auto-embed on write, DEFERRED to the background worker.
+        // The old inline call added ~6.7ms of ONNX inference to every
+        // content-changing write (62x latency, ~145 writes/s ceiling). Deferral
+        // is safe by this path's own contract: the embed already ran after
+        // tx.commit() and failures were explicitly non-fatal (the row just
+        // doesn't surface in dense/hybrid search until embedded). The worker
+        // embeds the PLAINTEXT body_json and re-verifies it against the row
+        // before storing (stale guard), so a queued vector can never overwrite
+        // a newer body's embedding. The #219 session cache is intentionally not
+        // consulted here: new/changed bodies are unique by definition, so the
+        // write path only ever paid up to 256 full-body string compares for a
+        // guaranteed miss. Gated on the content-changed signal so identical
+        // re-asserts don't even enqueue.
         if should_embed && self.embedding_config.enabled {
-            match self.generate_embedding_with_fallback(&entity.body_json) {
-                Ok(vec) => {
-                    // #397: store on the connection this remember() already
-                    // holds — no nested pool draw on the write hot path.
-                    if let Err(e) = Self::store_embedding_with_conn(&conn, &id, &vec) {
-                        eprintln!("mimir: auto-embed store failed for {}: {}", id, e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("mimir: auto-embed generation failed for {}: {}", id, e)
-                }
-            }
+            self.enqueue_auto_embed(&id, &entity.body_json);
         }
 
         Ok((id, action))
@@ -7083,6 +7385,37 @@ If no clear lessons found, return: {{"lessons": []}}"#,
 
 }
 
+/// #393: graceful shutdown of the background auto-embed worker so tests and
+/// the CLI exit cleanly. Signals shutdown, disconnects the queue, and waits a
+/// bounded 5s for the worker's completion signal before joining: the in-flight
+/// embed finishes, remaining QUEUED jobs are skipped/dropped (fine by the
+/// best-effort contract — those rows stay unembedded until their next change
+/// or a `mimir_embed` batch pass). If the worker is wedged in a slow remote
+/// embed call past the wait, the thread is detached rather than blocking
+/// Drop — it exits on its own once the call times out.
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(worker) = self.embed_worker.take() {
+            worker
+                .shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Disconnect the channel so the worker's recv() terminates once
+            // the (now skip-drained) buffer is empty.
+            drop(worker.tx);
+            let finished = worker
+                .done_rx
+                .lock()
+                .map(|rx| {
+                    rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok()
+                })
+                .unwrap_or(false);
+            if finished {
+                let _ = worker.handle.join();
+            }
+        }
+    }
+}
+
 /// Compute cosine similarity between two vectors.
 /// Compute SHA-256 chain hash for the next journal entry.
 /// chain = SHA-256(prev_hash || event_id || created_at_ms)
@@ -7699,6 +8032,15 @@ mod tests {
         (db, path_str)
     }
 
+    /// #393: auto-embed is asynchronous — tests that assert on embeddings (or
+    /// on behavior gated on embedding_coverage) must drain the queue first.
+    fn flush_embeds(db: &Database) {
+        assert!(
+            db.embed_queue_flush(std::time::Duration::from_secs(60)),
+            "auto-embed queue must drain within 60s"
+        );
+    }
+
     fn make_entity(id: &str, category: &str, key: &str, body: &str) -> Entity {
         Entity {
             id: id.to_string(),
@@ -7836,6 +8178,8 @@ mod tests {
             embedding_config: crate::embedding::EmbeddingConfig::default(),
             embedding_cache: std::sync::Mutex::new(EmbeddingCache::new(256)),
             connectors: Vec::new(),
+            embed_worker: std::sync::OnceLock::new(),
+            embed_queue_cap: EMBED_QUEUE_CAP,
         };
 
         db.remember_skip_dedup(&make_entity(
@@ -12452,6 +12796,7 @@ mod tests {
             "depends_on",
         )
         .unwrap();
+        flush_embeds(&db); // #393: the dense arm needs the deferred auto-embeds landed
 
         let params = crate::models::RecallParams {
             query: "checkout payment processing service".to_string(),
@@ -13505,7 +13850,6 @@ mod tests {
     // the default `bundled-embeddings` build (lite-build has no backend and
     // would have nothing to embed).
 
-    #[cfg(feature = "bundled-embeddings")]
     fn raw_embedding(db: &Database, id: &str) -> Option<Vec<u8>> {
         db.conn()
             .unwrap()
@@ -13529,6 +13873,9 @@ mod tests {
             "{\"content\":\"the cat sat on the warm sunny windowsill\"}",
         );
         let (id, _action) = db.remember(&e).unwrap();
+        // #393: the embed is deferred to the background worker — drain it
+        // before asserting.
+        flush_embeds(&db);
         let emb = raw_embedding(&db, &id);
         assert!(
             emb.is_some() && !emb.unwrap().is_empty(),
@@ -13556,6 +13903,7 @@ mod tests {
             "{\"content\":\"a golden retriever puppy playing in the park\"}",
         ))
         .unwrap();
+        flush_embeds(&db); // #393: embeds land asynchronously
         assert_eq!(
             db.embedding_coverage(),
             2,
@@ -13575,6 +13923,9 @@ mod tests {
             "{\"content\":\"distributed consensus via raft leader election\"}",
         );
         let (id, _) = db.remember(&e).unwrap();
+        // #393: let the deferred auto-embed land BEFORE planting the sentinel,
+        // or the queued job would (correctly — body unchanged) overwrite it.
+        flush_embeds(&db);
         // Overwrite the auto-embedding with a sentinel vector. If an identical
         // re-write recomputes, the sentinel is clobbered; if the content-changed
         // gate works, the sentinel survives untouched.
@@ -13589,6 +13940,9 @@ mod tests {
 
         // Re-remember the SAME body — must NOT recompute the embedding.
         db.remember(&e).unwrap();
+        // #393: an identical re-assert must not even ENQUEUE — the flush is a
+        // no-op that just makes the negative assertion race-free.
+        flush_embeds(&db);
         assert_eq!(
             raw_embedding(&db, &id),
             Some(sentinel.clone()),
@@ -13603,6 +13957,7 @@ mod tests {
             "{\"content\":\"a totally different topic about baking sourdough bread\"}",
         );
         db.remember(&changed).unwrap();
+        flush_embeds(&db); // #393: the recompute happens in the worker
         let after = raw_embedding(&db, &id).unwrap();
         assert_ne!(after, sentinel, "a content change must recompute the embedding");
         assert!(!after.is_empty());
@@ -13627,6 +13982,7 @@ mod tests {
             "{\"content\":\"quarterly financial revenue and corporate tax accounting report\"}",
         ))
         .unwrap();
+        flush_embeds(&db); // #393: coverage (and thus hybrid auto-select) needs the embeds landed
         assert!(db.embedding_coverage() > 0);
 
         // No `mode` field at all → handle_recall must auto-select hybrid.
@@ -13664,6 +14020,7 @@ mod tests {
             "{\"content\":\"corporate quarterly tax filing and accounting compliance deadlines\"}",
         ))
         .unwrap();
+        flush_embeds(&db); // #393: dense ranking needs the deferred embeds landed
 
         let args = serde_json::json!({ "query": "canine pet animal playing outdoors", "limit": 5 });
         let out = crate::tools::handle_semantic_search(&db, args).unwrap();
@@ -13676,6 +14033,274 @@ mod tests {
             Some("s-dog"),
             "dense-ranked order must put the semantically nearest entity first; got {:?}",
             keys
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // ─── #393: deferred auto-embed — queue/worker/guard mechanics ───────────
+    // These drive the REMOTE-endpoint embedder against a local fake HTTP
+    // server with a controllable per-embed delay, so they run in both the
+    // default and lite builds and can prove ordering properties (the local
+    // ONNX path shares the same queue/worker/guard mechanics).
+
+    /// Spawn a fake Ollama-format `/api/embed` server on an ephemeral port.
+    /// Every request sleeps `delay`, then answers
+    /// `{"embeddings": [[<request content-length>, 1.0, 2.0]]}` — the vector
+    /// encodes the request body length, so embeds of different texts are
+    /// distinguishable in assertions (see `expected_fake_vec_first`).
+    fn spawn_fake_embed_server(delay: std::time::Duration) -> u16 {
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake embed server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let mut header_end: Option<usize> = None;
+                    let mut content_len: Option<usize> = None;
+                    loop {
+                        if let (Some(he), Some(cl)) = (header_end, content_len) {
+                            if buf.len() >= he + cl {
+                                break;
+                            }
+                        }
+                        match s.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if header_end.is_none() {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                header_end = Some(pos + 4);
+                                let head =
+                                    String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                                content_len = head.lines().find_map(|l| {
+                                    l.strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                });
+                            }
+                        }
+                    }
+                    let cl = content_len.unwrap_or(0);
+                    std::thread::sleep(delay);
+                    let body = format!("{{\"embeddings\": [[{}.0, 1.0, 2.0]]}}", cl);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                });
+            }
+        });
+        port
+    }
+
+    /// The first component of the vector the fake server answers for `text` —
+    /// the content-length of the exact request `call_ollama_embed` sends.
+    fn expected_fake_vec_first(model: &str, text: &str) -> f32 {
+        serde_json::to_string(&serde_json::json!({"model": model, "input": text}))
+            .unwrap()
+            .len() as f32
+    }
+
+    /// temp_db wired to the fake embed server: the local-ONNX config points at
+    /// a path that cannot exist, so the backend chain deterministically falls
+    /// through to the remote endpoint in BOTH the default and lite builds.
+    fn db_with_fake_embed_endpoint(
+        delay: std::time::Duration,
+        queue_cap: Option<usize>,
+    ) -> (Database, String) {
+        let (mut db, path) = temp_db();
+        if let Some(cap) = queue_cap {
+            db.set_embed_queue_cap(cap);
+        }
+        let missing = std::env::temp_dir()
+            .join(format!("mimir-no-model-{}", uuid::Uuid::new_v4()))
+            .join("model.onnx");
+        db.set_embedding_model(missing.to_str().unwrap());
+        let port = spawn_fake_embed_server(delay);
+        db.set_llm(
+            true,
+            &format!("http://127.0.0.1:{port}/api/generate"),
+            "fake-embed",
+            None,
+            Some(&format!("http://127.0.0.1:{port}/api/embed")),
+        );
+        (db, path)
+    }
+
+    /// #393 regression: a content-changing write must return without waiting
+    /// on the embedding backend. Pre-fix this fails on both assertions: the
+    /// write blocked ~500ms on the fake backend and the embedding was already
+    /// stored when it returned.
+    #[test]
+    fn write_path_does_not_block_on_slow_embed_backend() {
+        let (db, path) =
+            db_with_fake_embed_endpoint(std::time::Duration::from_millis(500), None);
+        let body = "{\"content\":\"write must return before the 500ms embed completes\"}";
+        let t = std::time::Instant::now();
+        let (id, _) = db
+            .remember(&make_entity("nb-1", "insight", "nb-key", body))
+            .unwrap();
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "write path must not block on the embedding backend (took {:?}, backend delay is 500ms)",
+            elapsed
+        );
+        // Ordering proof: the embed is still in flight when the write returns.
+        assert!(
+            raw_embedding(&db, &id).is_none(),
+            "embedding must NOT be stored synchronously with the write"
+        );
+        // ... and lands once the queue is drained.
+        assert!(
+            db.embed_queue_flush(std::time::Duration::from_secs(30)),
+            "embed queue must drain"
+        );
+        let emb = raw_embedding(&db, &id).expect("embedding must land after flush");
+        let first = f32::from_le_bytes(emb[0..4].try_into().unwrap());
+        assert_eq!(
+            first,
+            expected_fake_vec_first("fake-embed", body),
+            "the stored vector must be the backend's answer for this body"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #393 stale guard, deterministic unit level: a queued job's vector only
+    /// lands while the entity's CURRENT plaintext still equals the text it was
+    /// computed from; a changed or forgotten body refuses the write.
+    #[test]
+    fn stale_guard_refuses_embedding_for_changed_or_forgotten_body() {
+        let (mut db, path) = temp_db();
+        // No background jobs — this test drives the guard directly.
+        db.embedding_config.enabled = false;
+        db.remember(&make_entity(
+            "sg-1",
+            "insight",
+            "sg-key",
+            "{\"content\":\"current body\"}",
+        ))
+        .unwrap();
+        let conn = db.conn().unwrap();
+
+        // Stale plaintext (what an outdated queued job would carry): refused.
+        let landed = Database::store_embedding_guarded_with_conn(
+            &conn,
+            "sg-1",
+            "{\"content\":\"an OLDER body\"}",
+            &[0.25, 0.5],
+        )
+        .unwrap();
+        assert!(!landed, "stale-plaintext embed must be refused");
+        assert!(raw_embedding(&db, "sg-1").is_none());
+
+        // Current plaintext: lands.
+        let landed = Database::store_embedding_guarded_with_conn(
+            &conn,
+            "sg-1",
+            "{\"content\":\"current body\"}",
+            &[0.25, 0.5],
+        )
+        .unwrap();
+        assert!(landed, "current-plaintext embed must land");
+        assert!(raw_embedding(&db, "sg-1").is_some());
+
+        // FTS row gone (entity forgotten since enqueue): refused even with
+        // matching text — a forgotten row must not be re-embedded.
+        conn.execute(
+            "DELETE FROM entities_fts WHERE rowid = (SELECT rowid FROM entities WHERE id = 'sg-1')",
+            [],
+        )
+        .unwrap();
+        let landed = Database::store_embedding_guarded_with_conn(
+            &conn,
+            "sg-1",
+            "{\"content\":\"current body\"}",
+            &[0.9, 0.9],
+        )
+        .unwrap();
+        assert!(!landed, "an entity without an FTS row must be refused");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #393 stale guard, end to end: enqueue an embed for body A, change the
+    /// body to B while A is still in flight, flush — the stored embedding must
+    /// reflect B, never A. (Job A is either guard-skipped, or landed before B's
+    /// write and then overwritten by job B; both satisfy the invariant.)
+    #[test]
+    fn stale_deferred_embed_never_overwrites_newer_body() {
+        let (db, path) =
+            db_with_fake_embed_endpoint(std::time::Duration::from_millis(400), None);
+        let body_a = "{\"content\":\"version A of this fact\"}";
+        let body_b =
+            "{\"content\":\"version B, the much longer replacement body of this fact\"}";
+        let (id, _) = db
+            .remember(&make_entity("st-1", "insight", "st-key", body_a))
+            .unwrap();
+        // Change the body while job A is still queued / in flight.
+        db.remember(&make_entity("st-1", "insight", "st-key", body_b))
+            .unwrap();
+        assert!(db.embed_queue_flush(std::time::Duration::from_secs(30)));
+        let emb = raw_embedding(&db, &id).expect("newest body's embedding must land");
+        let first = f32::from_le_bytes(emb[0..4].try_into().unwrap());
+        assert_eq!(
+            first,
+            expected_fake_vec_first("fake-embed", body_b),
+            "embedding must reflect the NEWEST body"
+        );
+        assert_ne!(
+            first,
+            expected_fake_vec_first("fake-embed", body_a),
+            "a stale queued embed must never be the surviving vector"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #393 overflow policy: with the queue bound shrunk to 1 and a slow
+    /// backend, rapid writes overflow the queue; newest jobs are dropped, no
+    /// write ever blocks, and flush still terminates (dropped jobs must not
+    /// leave waiters hanging).
+    #[test]
+    fn embed_queue_overflow_drops_newest_and_flush_still_drains() {
+        let (db, path) =
+            db_with_fake_embed_endpoint(std::time::Duration::from_millis(400), Some(1));
+        for i in 0..4 {
+            db.remember_skip_dedup(&make_entity(
+                &format!("of-{i}"),
+                "insight",
+                &format!("of-{i}"),
+                &format!("{{\"content\":\"overflow probe number {i} with distinct words\"}}"),
+            ))
+            .unwrap();
+        }
+        assert!(
+            db.embed_queue_flush(std::time::Duration::from_secs(30)),
+            "flush must drain despite overflow drops"
+        );
+        let conn = db.conn().unwrap();
+        let embedded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE embedding IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE embedding IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(embedded >= 1, "in-flight/queued jobs must still complete");
+        assert!(
+            missing >= 1,
+            "cap=1 with 4 rapid writes must drop at least one job (drop-new); got {embedded} embedded / {missing} missing"
         );
         let _ = fs::remove_file(&path);
     }
@@ -14105,6 +14730,48 @@ mod tests {
         }
         // else: dead entity was auto-archived, which is an even stronger pass.
 
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #393 measurement probe: median write latency with auto-embed enabled.
+    /// Run explicitly (`cargo test probe_write_latency_embed_on -- --ignored
+    /// --nocapture`); ignored by default because it is a measurement, not an
+    /// assertion.
+    #[cfg(feature = "bundled-embeddings")]
+    #[test]
+    #[ignore]
+    fn probe_write_latency_embed_on() {
+        let (db, path) = temp_db();
+        // Warm the ONNX session so the probe measures steady state, not the
+        // one-time graph load.
+        db.remember(&make_entity(
+            "warm",
+            "insight",
+            "warm",
+            "{\"content\":\"warm up the onnx session before probing\"}",
+        ))
+        .unwrap();
+        let mut lat: Vec<u128> = Vec::new();
+        for i in 0..40 {
+            // ~1KB unique-ish body (matches the issue's measurement shape).
+            let body = format!(
+                "{{\"content\":\"probe {} entry with some distinct words {} {}\"}}",
+                i,
+                i * 7919,
+                "lorem ipsum dolor sit amet ".repeat(35)
+            );
+            let e = make_entity(&format!("p-{i}"), "insight", &format!("p-{i}"), &body);
+            let t = std::time::Instant::now();
+            db.remember_skip_dedup(&e).unwrap();
+            lat.push(t.elapsed().as_micros());
+        }
+        lat.sort_unstable();
+        eprintln!(
+            "probe_write_latency_embed_on: median {}us p95 {}us (n={})",
+            lat[lat.len() / 2],
+            lat[lat.len() * 95 / 100],
+            lat.len()
+        );
         let _ = fs::remove_file(&path);
     }
 }

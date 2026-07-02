@@ -14,6 +14,29 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   workspace's row (or the global `''` row) phantom counts. Omitted = the
   existing deterministic pick, unchanged.
 
+### Changed
+- Auto-embed on content-changing writes now runs on a background worker
+  instead of inline (#393): the synchronous ONNX call added ~6.7ms to every
+  default-build write (62×, ~145 writes/s single-writer ceiling). Writes now
+  enqueue (id, plaintext) to a bounded queue (1024 jobs, drop-new on overflow
+  with a rate-limited warning) and return immediately; the worker drains up
+  to 32 jobs per wake, embeds, and stores each vector through a stale guard
+  (an atomic conditional UPDATE against the entity's current FTS plaintext),
+  so a queued embed can never overwrite a newer body's vector. Deferral is
+  within the existing contract — auto-embed already ran post-commit with
+  non-fatal failures; a row simply doesn't surface in dense/hybrid search
+  until embedded (now milliseconds later; dropped-on-overflow rows are
+  recoverable via `mimir_embed` batch mode or their next change). Explicit
+  `mimir_embed` stays synchronous. The write path also no longer consults
+  the #219 embedding session cache (new/changed bodies can never hit it —
+  each write paid up to 256 full-body string compares for nothing), and the
+  misconfigured-backend log (enabled, model missing, no endpoint — formerly
+  one eprintln per write) is rate-limited to once per minute. `Drop` for
+  `Database` signals the worker and waits up to 5s: the in-flight embed
+  finishes, remaining queued jobs are dropped. Measured (debug profile,
+  1KB bodies, bundled ONNX, n=40, median-of-5-runs): write median
+  7,714µs → ~159µs (~48×).
+
 ### Fixed
 - `follow()`'s row resolution no longer collapses real DB errors into
   "not found" (#396, the #394 principle): only `QueryReturnedNoRows` maps to
