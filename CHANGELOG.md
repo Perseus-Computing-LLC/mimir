@@ -46,6 +46,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   count 53 → 55.
 
 ### Fixed
+- Bi-temporal audit gap (#371): an identical-body re-remember that moves the
+  bounds of an already-CLOSED valid period (e.g. re-extending past a
+  `mimir_supersede`/`set_valid_to` close) now snapshots the pre-change version
+  to `entity_history` and advances the live row's transaction time, so
+  `mimir_history`/`mimir_bitemporal` reconstruct both the closed period and
+  the re-extension. Acceptance semantics are unchanged (deliberate re-asserts
+  may still extend); re-asserts that leave the period untouched write no
+  spurious snapshot.
 - Context injection relevance gating (#356): `context`/`prepare` no longer
   dump topically unrelated entities — injection is gated by `recall_when`
   trigger matching + stopword-filtered keyword search against the current

@@ -3012,6 +3012,223 @@ mod tests {
     }
 
     #[test]
+    fn reassert_extending_closed_period_is_audited() {
+        // #371: an identical-body re-assert MAY deliberately extend a period
+        // that was closed via set_valid_to (intended semantics, unchanged),
+        // but the change must be AUDITED — the pre-extension period is
+        // snapshotted to entity_history and both periods stay reconstructable.
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let vf = now - 100_000;
+        let body = "{\"note\":\"audited extension\"}";
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "audited", "body_json": body,
+                   "valid_from_unix_ms": vf}),
+        )
+        .expect("baseline fact");
+        let ent = db.get_entity("facts", "audited").unwrap().unwrap();
+
+        // Close the fact (audit-relevant precondition: stored valid_to non-NULL).
+        let t2 = now - 50_000;
+        assert_eq!(db.set_valid_to(&ent.id, t2).expect("close"), t2);
+        let hist_before = db.history_versions("facts", "audited").unwrap().len();
+
+        sleep(Duration::from_millis(5));
+        let tx_closed = now_ms(); // transaction instant while the close was current knowledge
+        sleep(Duration::from_millis(5));
+
+        // Identical body, valid_to extending PAST the close: accepted (option
+        // (b) semantics) AND snapshotted.
+        let t3 = now + 50_000;
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "audited", "body_json": body,
+                   "valid_to_unix_ms": t3}),
+        )
+        .expect("identical-body re-assert extending a closed period is accepted");
+
+        // Exactly one new history snapshot, carrying the pre-extension close.
+        let hist = db.history_versions("facts", "audited").unwrap();
+        assert_eq!(
+            hist.len(),
+            hist_before + 1,
+            "audited re-assert must snapshot the pre-extension version"
+        );
+
+        // Live period now reaches t3: an instant past the old close answers.
+        let probe = t2 + 1_000;
+        let r = handle_valid_at(
+            &db,
+            json!({"category": "facts", "key": "audited", "valid_at_unix_ms": probe}),
+        )
+        .expect("valid_at");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(t3), "{r}");
+        assert_eq!(v["is_live_version"], json!(true), "{r}");
+
+        // Reconstruction shows BOTH periods across transaction time:
+        // (a) as of tx_closed, the fact had ended at t2 — the probe instant is
+        //     unanswerable and an in-period instant reports the old close…
+        let r = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "audited",
+                   "tx_at_unix_ms": tx_closed, "valid_at_unix_ms": probe}),
+        )
+        .expect("bitemporal old-knowledge cell");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(false), "pre-extension knowledge must keep the close: {r}");
+        let r = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "audited",
+                   "tx_at_unix_ms": tx_closed, "valid_at_unix_ms": t2 - 1_000}),
+        )
+        .expect("bitemporal old-knowledge in-period cell");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(t2), "{r}");
+        // (b) …while current knowledge answers the probe with the extension.
+        let r = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "audited",
+                   "tx_at_unix_ms": now_ms(), "valid_at_unix_ms": probe}),
+        )
+        .expect("bitemporal new-knowledge cell");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(t3), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reassert_moving_valid_from_on_closed_period_is_audited() {
+        // #371 (review follow-up): the one-sided valid_from flavor. A closed
+        // fact [t0, t5) re-asserted with ONLY valid_from = t1 (legal: t1 < t5,
+        // COALESCE keeps the stored close) moves the opening — accepted, and
+        // audited exactly like the valid_to extension: one snapshot preserving
+        // [t0, t5), live period now [t1, t5).
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let t0 = now - 100_000;
+        let t1 = now - 80_000;
+        let t5 = now - 50_000;
+        let body = "{\"note\":\"opening moved\"}";
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "moved-open", "body_json": body,
+                   "valid_from_unix_ms": t0, "valid_to_unix_ms": t5}),
+        )
+        .expect("closed fact [t0, t5)");
+        let hist_before = db.history_versions("facts", "moved-open").unwrap().len();
+
+        sleep(Duration::from_millis(5));
+        let tx_before = now_ms(); // while [t0, t5) was current knowledge
+        sleep(Duration::from_millis(5));
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "moved-open", "body_json": body,
+                   "valid_from_unix_ms": t1}),
+        )
+        .expect("one-sided valid_from before the stored close is accepted");
+
+        // Exactly one new snapshot.
+        assert_eq!(
+            db.history_versions("facts", "moved-open").unwrap().len(),
+            hist_before + 1,
+            "audited valid_from move must snapshot the pre-change version"
+        );
+
+        // Live period is now [t1, t5): an in-period instant answers live…
+        let r = handle_valid_at(
+            &db,
+            json!({"category": "facts", "key": "moved-open", "valid_at_unix_ms": t1 + 1_000}),
+        )
+        .expect("valid_at in the moved period");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["valid_from_unix_ms"], json!(t1), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(t5), "{r}");
+        assert_eq!(v["is_live_version"], json!(true), "{r}");
+
+        // …while as-of tx_before the history row still answers with the
+        // original [t0, t5) — the pre-change period is fully preserved.
+        let r = handle_bitemporal(
+            &db,
+            json!({"category": "facts", "key": "moved-open",
+                   "tx_at_unix_ms": tx_before, "valid_at_unix_ms": t0 + 1_000}),
+        )
+        .expect("bitemporal old-knowledge cell");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["valid_from_unix_ms"], json!(t0), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(t5), "{r}");
+        assert_eq!(v["is_live_version"], json!(false), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reassert_with_unchanged_period_writes_no_snapshot() {
+        // #371: the audit snapshot fires only when the effective period
+        // actually CHANGES — an identical-body re-assert with the same stored
+        // bounds, or with bounds omitted, must not write spurious history.
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let vf = now - 100_000;
+        let vt = now - 50_000;
+        let body = "{\"note\":\"no spurious history\"}";
+
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "quiet", "body_json": body,
+                   "valid_from_unix_ms": vf, "valid_to_unix_ms": vt}),
+        )
+        .expect("closed fact");
+        let hist_before = db.history_versions("facts", "quiet").unwrap().len();
+
+        // (a) Bounds omitted: COALESCE keeps the stored period.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "quiet", "body_json": body}),
+        )
+        .expect("re-assert without bounds");
+        // (b) Same bounds re-sent explicitly: effective period unchanged.
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "quiet", "body_json": body,
+                   "valid_from_unix_ms": vf, "valid_to_unix_ms": vt}),
+        )
+        .expect("re-assert with identical bounds");
+
+        assert_eq!(
+            db.history_versions("facts", "quiet").unwrap().len(),
+            hist_before,
+            "period-unchanged re-asserts must not snapshot"
+        );
+        // Stored period untouched.
+        let r = handle_valid_at(
+            &db,
+            json!({"category": "facts", "key": "quiet", "valid_at_unix_ms": vt - 1_000}),
+        )
+        .expect("valid_at");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["found"], json!(true), "{r}");
+        assert_eq!(v["valid_from_unix_ms"], json!(vf), "{r}");
+        assert_eq!(v["valid_to_unix_ms"], json!(vt), "{r}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn bitemporal_tool_reports_both_axes() {
         use std::thread::sleep;
         use std::time::Duration;

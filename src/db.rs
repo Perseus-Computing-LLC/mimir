@@ -1715,6 +1715,47 @@ impl Database {
                 old_raw_body.clone()
             };
             let content_changed = old_plain_body != entity.body_json;
+
+            // #371: an identical-body re-assert flows through the COALESCE
+            // UPDATE below, which lets explicit valid_from/valid_to move the
+            // bounds of an already-CLOSED period (extension past a
+            // set_valid_to close, or any bound movement) with no audit trail.
+            // That is intended semantics — a deliberate re-assert may re-extend
+            // a closed fact — but it must be AUDITED: snapshot the pre-change
+            // version into entity_history exactly like a content change does,
+            // so history/bitemporal_at reconstruction shows both periods.
+            // Scope: only when the stored period was closed (valid_to non-NULL)
+            // and the effective bounds actually change; an unchanged period
+            // (same bounds, or bounds omitted — COALESCE keeps stored values,
+            // so an explicit re-open to NULL is not even expressible on this
+            // path) writes NO spurious snapshot. Acceptance is unchanged: the
+            // inversion guards below still apply.
+            //
+            // Some(old effective valid_from) when the change must be audited —
+            // carried to the stamp UPDATE below so the effective opening can
+            // be pinned before recorded_at moves; None otherwise.
+            let audit_reassert_from: Option<i64> = if !content_changed
+                && (valid_from.is_some() || valid_to.is_some())
+            {
+                let (stored_eff_from, stored_to): (i64, Option<i64>) = conn.query_row(
+                    "SELECT COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
+                            valid_to_unix_ms \
+                     FROM entities WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let new_eff_from = valid_from.unwrap_or(stored_eff_from);
+                let new_to = valid_to.or(stored_to);
+                if stored_to.is_some() && (new_eff_from != stored_eff_from || new_to != stored_to)
+                {
+                    Some(stored_eff_from)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let audit_period_change = audit_reassert_from.is_some();
             // Guarantee this version's recorded_at is strictly after the
             // superseded version's own recorded_at, so as_of() sees a real,
             // non-zero-width interval. now_ms() has 1ms resolution; two
@@ -1723,7 +1764,7 @@ impl Database {
             // recorded_at == invalidated_at == now, which as_of()'s strict
             // `invalidated_at_unix_ms > ?` can never match for any timestamp
             // -- permanently unreachable despite mimir_history still listing it.
-            let now = if content_changed {
+            let now = if content_changed || audit_period_change {
                 let old_recorded_or_created: i64 = conn
                     .query_row(
                         "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms) FROM entities WHERE id = ?1",
@@ -1803,7 +1844,10 @@ impl Database {
             // = now (transaction time it was retired); superseded_by = the live id
             // that replaces it. Other columns (incl. the prior recorded_at) copied
             // verbatim, so the version was live during [recorded_at, invalidated_at).
-            if content_changed {
+            // Also taken for an audited period change on an identical-body
+            // re-assert (#371) — same body, but the pre-change valid period
+            // must stay reconstructable.
+            if content_changed || audit_period_change {
                 tx.execute(
                     "INSERT INTO entity_history
                      (history_id, id, category, key, body_json, status, type, tags,
@@ -1875,6 +1919,26 @@ impl Database {
                     "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2,
                         valid_from_unix_ms = ?4, valid_to_unix_ms = ?5 WHERE id = ?3",
                     params![now, history_id, id, valid_from.unwrap_or(now), valid_to],
+                )?;
+            } else if let Some(old_eff_from) = audit_reassert_from {
+                // #371: the audited re-assert is a new version of knowledge
+                // recorded at `now` — advance recorded_at and link back to the
+                // snapshot so as_of's contiguous partition holds (history row
+                // live during [old recorded_at, now), live row from [now, ∞)).
+                // The valid bounds were already applied by the COALESCE UPDATE
+                // above (caller's values where supplied, stored otherwise), so
+                // unlike the content-change stamp they are not re-set here —
+                // EXCEPT to pin a still-NULL valid_from (pre-v9 rows a legacy
+                // binary may still write; schema.rs keeps them queryable) to
+                // the OLD effective opening. Readers derive effective
+                // valid_from via COALESCE(valid_from, recorded_at, …), so
+                // advancing recorded_at over a NULL valid_from would silently
+                // jump the opening to `now` and could invert the live period
+                // against a caller valid_to that the guards accepted.
+                tx.execute(
+                    "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2,
+                        valid_from_unix_ms = COALESCE(valid_from_unix_ms, ?4) WHERE id = ?3",
+                    params![now, history_id, id, old_eff_from],
                 )?;
             }
 
