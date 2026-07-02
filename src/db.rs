@@ -3435,12 +3435,17 @@ impl Database {
     }
 
     /// List entities with pagination and optional filters.
+    /// `workspace_hash`: when `Some(non-empty)`, only entities with a matching
+    /// workspace_hash are returned — same exact-match scoping `recall()` and
+    /// `context()` use (#338/#343). Without it, the web dashboard's entity
+    /// list leaked every workspace's memory into one view.
     pub fn list_entities(
         &self,
         offset: i64,
         limit: i64,
         category: Option<&str>,
         layer: Option<&str>,
+        workspace_hash: Option<&str>,
     ) -> Result<Vec<Entity>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let mut sql = String::from(
@@ -3466,6 +3471,12 @@ impl Database {
                 params.push(Box::new(l.to_string()));
             }
         }
+        if let Some(ws) = workspace_hash {
+            if !ws.is_empty() {
+                sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
+                params.push(Box::new(ws.to_string()));
+            }
+        }
 
         sql.push_str(" ORDER BY last_accessed_unix_ms DESC");
         sql.push_str(&format!(
@@ -3489,7 +3500,53 @@ impl Database {
         Ok(items)
     }
 
+    /// Count entities matching the same filters as `list_entities`, with no
+    /// LIMIT/OFFSET — lets callers (the web dashboard) report a true total
+    /// instead of "count of items in this page".
+    pub fn count_entities(
+        &self,
+        category: Option<&str>,
+        layer: Option<&str>,
+        workspace_hash: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut sql = String::from("SELECT COUNT(*) FROM entities WHERE archived = 0");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(cat) = category {
+            if !cat.is_empty() {
+                sql.push_str(&format!(" AND category = ?{}", params.len() + 1));
+                params.push(Box::new(cat.to_string()));
+            }
+        }
+        if let Some(l) = layer {
+            if !l.is_empty() {
+                sql.push_str(&format!(" AND layer = ?{}", params.len() + 1));
+                params.push(Box::new(l.to_string()));
+            }
+        }
+        if let Some(ws) = workspace_hash {
+            if !ws.is_empty() {
+                sql.push_str(&format!(" AND workspace_hash = ?{}", params.len() + 1));
+                params.push(Box::new(ws.to_string()));
+            }
+        }
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn.query_row(&sql, param_refs.as_slice(), |r| r.get(0))?;
+        Ok(count)
+    }
+
     /// Get recent journal events.
+    ///
+    /// NOTE: the `journal` table has no `workspace_hash` column, so
+    /// this cannot be scoped to a workspace the way `list_entities`/
+    /// `get_entity_graph`/`context`/`recall_when` now are. In a federated
+    /// vault, journal events from every workspace are visible here. Fixing
+    /// this properly needs a schema migration (new column + SCHEMA_VERSION
+    /// bump + JournalEvent struct + every journal() call site) — tracked as
+    /// a follow-up rather than folded into this pass.
     pub fn get_recent_journal(
         &self,
         limit: i64,
@@ -3522,41 +3579,69 @@ impl Database {
     }
 
     /// Build an entity link graph: nodes + edges for visualization.
+    /// `workspace_hash`: when `Some(non-empty)`, only entities (nodes) whose
+    /// workspace_hash matches are included; edges to a target outside that
+    /// scope are dropped rather than pointing at a node the caller never
+    /// receives (the dashboard's graph tab leaked cross-workspace
+    /// nodes/edges before this).
     pub fn get_entity_graph(
         &self,
+        workspace_hash: Option<&str>,
     ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let mut stmt = conn
-            .prepare("SELECT id, category, key, links FROM entities WHERE archived = 0")?;
-        let rows = stmt.query_map([], |row| {
+        let (sql, scoped) = match workspace_hash.filter(|ws| !ws.is_empty()) {
+            Some(_) => (
+                "SELECT id, category, key, links FROM entities WHERE archived = 0 AND workspace_hash = ?1",
+                true,
+            ),
+            None => (
+                "SELECT id, category, key, links FROM entities WHERE archived = 0",
+                false,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map_row = |row: &rusqlite::Row| {
             let id: String = row.get(0)?;
             let category: String = row.get(1)?;
             let key: String = row.get(2)?;
             let links_str: String = row.get::<_, String>(3).unwrap_or_else(|_| "[]".to_string());
             let links: Vec<MemoryLink> = serde_json::from_str(&links_str).unwrap_or_default();
             Ok((id, category, key, links))
-        })?;
+        };
+        let rows: Vec<(String, String, String, Vec<MemoryLink>)> = if scoped {
+            stmt.query_map(params![workspace_hash.unwrap()], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map([], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
 
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        for row in rows {
-            let (id, category, key, links) = row?;
+        for (id, category, key, links) in &rows {
             if seen_ids.insert(id.clone()) {
                 nodes.push(GraphNode {
                     id: id.clone(),
-                    label: key,
-                    category,
+                    label: key.clone(),
+                    category: category.clone(),
                 });
             }
-            for link in &links {
+            for link in links {
                 edges.push(GraphEdge {
                     from: id.clone(),
                     to: link.target_id.clone(),
                     relationship: link.relationship.clone(),
                 });
             }
+        }
+        if scoped {
+            // Drop edges pointing outside the scoped node set: the target
+            // entity is in a different workspace, so the caller never
+            // receives that node and a dangling edge would be meaningless
+            // (or, worse, leak the existence/id of a cross-workspace entity).
+            edges.retain(|e| seen_ids.contains(&e.to));
         }
         Ok((nodes, edges))
     }
