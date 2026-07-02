@@ -3584,6 +3584,12 @@ impl Database {
     }
 
     /// Update an entity's status (e.g., to "deprecated").
+    ///
+    /// UNAUDITED (#375): writes no entity_history snapshot and does not
+    /// advance recorded_at — the status change is applied to the live row in
+    /// place. A caller pairing this with an audited change (e.g. supersede's
+    /// set_valid_to close) must apply the audited change FIRST, or the
+    /// snapshot will bake the new status into pre-change history.
     pub fn update_entity_status(
         &self,
         id: &str,
