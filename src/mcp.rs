@@ -3119,7 +3119,7 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         },
         "valid_to_unix_ms": {
           "type": "integer",
-          "description": "When the OLD fact stopped being true in the world (#363, unix ms). Defaults to transaction time (now). Closes the old entity's application-time period so mimir_valid_at stops returning it from that instant on."
+          "description": "When the OLD fact stopped being true in the world (#363, unix ms). Defaults to transaction time (now). Closes the old entity's application-time period so mimir_valid_at stops returning it from that instant on. Must be after the fact's valid_from, and may only TIGHTEN an already-closed period (a fact that ended cannot be retroactively extended); violations are rejected before any mutation."
         }
       },
       "required": [

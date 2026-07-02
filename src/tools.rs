@@ -560,6 +560,18 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     let a: RecallArgs =
         serde_json::from_value(args).map_err(|e| format!("Invalid recall arguments: {}", e))?;
 
+    // #363 review: valid_op is a closed SQL:2011 enum — reject unknown strings
+    // instead of silently treating them as 'overlaps'. Validated up front so
+    // the expansion path is covered too. "" is the serde default (= overlaps).
+    match a.valid_op.as_str() {
+        "" | "overlaps" | "contains" => {}
+        other => {
+            return Err(format!(
+                "Invalid valid_op '{other}': expected 'overlaps' or 'contains'"
+            ))
+        }
+    }
+
     // #271: an unset `mode` ("" — the serde default) auto-selects the best
     // available strategy. When the embedding backend is on AND at least one
     // entity is embedded, default to Hybrid (deterministic dense + keyword RRF);
@@ -587,6 +599,9 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // #363: captured before RecallParams moves fields out of `a`.
     let (valid_at, valid_from, valid_to) = (a.valid_at, a.valid_from_unix_ms, a.valid_to_unix_ms);
     let valid_op = a.valid_op.clone();
+    let temporal_filtering = valid_at.is_some() || valid_from.is_some() || valid_to.is_some();
+    let mode_for_side_effects = mode.clone();
+    let reinforce_requested = a.reinforce;
 
     let params = RecallParams {
         query: a.query,
@@ -597,7 +612,14 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         min_decay: a.min_decay,
         topic_path: a.topic_path,
         include_archived: a.include_archived,
-        skip_side_effects: false,
+        // #363 review (a #356-class value inversion): with a valid-time filter
+        // present, the inner recall must be a PURE read — the fts5 path (and
+        // dense/hybrid with reinforce) otherwise reinforces every matched row,
+        // including the ones the filter is about to hide, so repeatedly asking
+        // "what was true at T" would make the invisible entities immortal.
+        // Side-effects are applied below to the SURVIVING hits only, mirroring
+        // the expansion path. Unfiltered calls keep the original behavior.
+        skip_side_effects: temporal_filtering,
         mode,
         embedding: None,
         preview_cap: a.preview_cap,
@@ -620,6 +642,17 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
 
     // #363: valid-time filters (no-op unless requested).
     valid_time_retain(db, valid_at, valid_from, valid_to, &valid_op, &mut entities)?;
+
+    // #363 review: re-apply the deferred recall side-effects to the survivors,
+    // under exactly the conditions the un-filtered path would have reinforced:
+    // fts5 always does; dense/hybrid only when the caller opted in.
+    if temporal_filtering
+        && (mode_for_side_effects == SearchMode::Fts5 || reinforce_requested)
+        && !entities.is_empty()
+    {
+        let ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
+        let _ = db.apply_recall_side_effects(&ids);
+    }
 
     let mut items_expanded: Vec<serde_json::Value> =
         entities.iter().map(|e| e.to_json_expanded()).collect();
@@ -2170,6 +2203,35 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
         .map_err(|e| format!("'To' entity lookup failed: {}", e))?
         .ok_or_else(|| format!("'To' entity not found: {}/{}", a.to_category, a.to_key))?;
 
+    // #363 review: validate an EXPLICIT valid_to against the old fact's stored
+    // period BEFORE any mutation, so a rejected close can't leave a half-done
+    // supersede (link created, status flipped, period untouched).
+    //   * it must not invert the period (vt <= valid_from), and
+    //   * it must not EXTEND an already-closed period — a fact that ended
+    //     stays ended; superseding may only tighten.
+    let periods = db
+        .valid_periods_for_ids(&[from_entity.id.clone()])
+        .map_err(|e| format!("'From' entity valid-period lookup failed: {}", e))?;
+    let (eff_from, cur_to) = periods
+        .get(&from_entity.id)
+        .copied()
+        .unwrap_or((from_entity.created_at_unix_ms, None));
+    if let Some(vt) = a.valid_to_unix_ms {
+        if vt <= eff_from {
+            return Err(format!(
+                "valid_to_unix_ms ({vt}) must be greater than the superseded fact's valid_from ({eff_from})"
+            ));
+        }
+        if let Some(cur) = cur_to {
+            if vt > cur {
+                return Err(format!(
+                    "valid_to_unix_ms ({vt}) would extend the superseded fact's already-closed \
+                     valid period (valid_to {cur}); superseding may only tighten it"
+                ));
+            }
+        }
+    }
+
     // 1. Create a "supersedes" relationship link
     db.link(
         &to_entity.category,
@@ -2185,9 +2247,16 @@ pub fn handle_supersede(db: &Database, args: Value) -> Result<String, String> {
 
     // 3. Close the OLD entity's valid-time period (#363): superseding a fact
     // records when it stopped being true in the world — at transaction time
-    // unless the caller says when.
-    let valid_to = a.valid_to_unix_ms.unwrap_or_else(now_ms);
-    db.set_valid_to(&from_entity.id, valid_to)
+    // unless the caller says when. The default close is bumped strictly past
+    // valid_from so a fact superseded within its creation millisecond still
+    // gets a non-inverted (if degenerate-width) period. set_valid_to itself
+    // never extends an already-closed period; the effective close (possibly
+    // the earlier stored one) is what gets reported.
+    let requested = a
+        .valid_to_unix_ms
+        .unwrap_or_else(|| now_ms().max(eff_from + 1));
+    let valid_to = db
+        .set_valid_to(&from_entity.id, requested)
         .map_err(|e| format!("Failed to close 'from' entity's valid period: {}", e))?;
 
     let result = json!({
@@ -2333,6 +2402,17 @@ pub struct CorrectArgs {
 pub fn handle_correct(db: &Database, args: Value) -> Result<String, String> {
     let a: CorrectArgs = serde_json::from_value(args)
         .map_err(|e| format!("Invalid correct arguments: {}", e))?;
+
+    // #363 review: same inverted-period rejection as mimir_remember — an
+    // inverted period would shadow older versions in bitemporal_at while
+    // never matching itself, making the fact unanswerable.
+    if let (Some(vf), Some(vt)) = (a.valid_from_unix_ms, a.valid_to_unix_ms) {
+        if vt <= vf {
+            return Err(format!(
+                "valid_to_unix_ms ({vt}) must be greater than valid_from_unix_ms ({vf})"
+            ));
+        }
+    }
 
     let params = crate::models::CorrectParams {
         wrong_approach: a.wrong_approach,
@@ -2912,6 +2992,214 @@ mod tests {
         .unwrap();
         let bv: Value = serde_json::from_str(&before).unwrap();
         assert_eq!(bv["found"], json!(true), "{before}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn temporal_filtered_recall_does_not_reinforce_hidden_entities() {
+        // #363 review, #356-class value inversion: a recall with a valid-time
+        // filter must NOT apply retrieval side-effects to entities the filter
+        // hides — otherwise repeated "what was true at T" queries reinforce
+        // (and eventually make immortal) entities that are never returned.
+        let (db, path) = temp_db();
+        let now = now_ms();
+
+        // A: valid only in a past window (always filtered out below).
+        handle_remember(
+            &db,
+            json!({"category": "ops", "key": "hidden-a", "body_json": "{\"note\":\"embargo period alpha\"}",
+                   "valid_from_unix_ms": now - 100_000, "valid_to_unix_ms": now - 50_000}),
+        )
+        .expect("A");
+        // B: currently valid (always survives).
+        handle_remember(
+            &db,
+            json!({"category": "ops", "key": "visible-b", "body_json": "{\"note\":\"embargo period bravo\"}"}),
+        )
+        .expect("B");
+
+        let count_of = |key: &str| -> i64 {
+            db.get_entity("ops", key).unwrap().unwrap().retrieval_count
+        };
+        assert_eq!(count_of("hidden-a"), 0);
+        assert_eq!(count_of("visible-b"), 0);
+
+        // Three temporal-filtered recalls: only B survives each time.
+        for _ in 0..3 {
+            let r = handle_recall(
+                &db,
+                json!({"query": "embargo", "mode": "fts5", "valid_at": now + 10_000}),
+            )
+            .expect("filtered recall");
+            let v: Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["total"], json!(1), "{r}");
+        }
+
+        assert_eq!(
+            count_of("hidden-a"),
+            0,
+            "filtered-out entity must NOT be reinforced by temporal recalls"
+        );
+        assert_eq!(
+            count_of("visible-b"),
+            3,
+            "surviving entity must still be reinforced once per recall"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unfiltered_recall_side_effects_and_output_are_unchanged() {
+        // #363 review: the pure-read deferral only engages when a valid-time
+        // filter is present. An unfiltered recall must keep the original
+        // behavior — side-effects applied to every hit — and an always-true
+        // filter must return the identical item set.
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "ops", "key": "u1", "body_json": "{\"note\":\"quorum call one\"}"}),
+        )
+        .expect("u1");
+        handle_remember(
+            &db,
+            json!({"category": "ops", "key": "u2", "body_json": "{\"note\":\"quorum call two\"}"}),
+        )
+        .expect("u2");
+
+        let unfiltered =
+            handle_recall(&db, json!({"query": "quorum", "mode": "fts5"})).expect("recall");
+        let uv: Value = serde_json::from_str(&unfiltered).unwrap();
+        assert_eq!(uv["total"], json!(2), "{unfiltered}");
+        for key in ["u1", "u2"] {
+            assert_eq!(
+                db.get_entity("ops", key).unwrap().unwrap().retrieval_count,
+                1,
+                "unfiltered recall must still reinforce every hit ({key})"
+            );
+        }
+
+        // An always-true valid filter returns the same keys.
+        let filtered = handle_recall(
+            &db,
+            json!({"query": "quorum", "mode": "fts5", "valid_at": now_ms() + 60_000}),
+        )
+        .expect("filtered recall");
+        let fv: Value = serde_json::from_str(&filtered).unwrap();
+        let keys = |v: &Value| -> Vec<String> {
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(keys(&uv), keys(&fv), "always-true filter must not change the result set");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recall_rejects_unknown_valid_op() {
+        let (db, path) = temp_db();
+        let err = handle_recall(
+            &db,
+            json!({"query": "x", "valid_from_unix_ms": 1, "valid_op": "during"}),
+        )
+        .expect_err("unknown valid_op must be rejected");
+        assert!(err.contains("valid_op") && err.contains("during"), "got: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn correct_rejects_inverted_valid_period() {
+        let (db, path) = temp_db();
+        let err = handle_correct(
+            &db,
+            json!({"wrong_approach": "w", "user_correction": "c", "task_context": "t",
+                   "valid_from_unix_ms": 200, "valid_to_unix_ms": 100}),
+        )
+        .expect_err("inverted period must be rejected on correct");
+        assert!(err.contains("valid_to_unix_ms"), "got: {err}");
+        // Nothing was written.
+        let r = handle_recall(&db, json!({"query": "", "category": "correction", "mode": "fts5"}))
+            .unwrap_or_else(|_| "{\"total\":0}".to_string());
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["total"], json!(0), "rejected correct must not create an entity: {r}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn supersede_valid_to_cannot_invert_or_extend_a_closed_period() {
+        // #363 review: an explicit valid_to on supersede must be validated
+        // against the old fact's stored period BEFORE any mutation, and a
+        // default-now supersede of an already-ended fact must keep the
+        // earlier close (never retroactively extend validity).
+        let (db, path) = temp_db();
+        let now = now_ms();
+        let vf = now - 100_000;
+        let vt = now - 50_000;
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "ended", "body_json": "{\"note\":\"old bounded\"}",
+                   "valid_from_unix_ms": vf, "valid_to_unix_ms": vt}),
+        )
+        .expect("bounded old fact");
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "successor", "body_json": "{\"note\":\"new\"}"}),
+        )
+        .expect("successor");
+
+        // (a) Inverted: valid_to at/before the old fact's valid_from.
+        let err = handle_supersede(
+            &db,
+            json!({"from_category": "facts", "from_key": "ended",
+                   "to_category": "facts", "to_key": "successor",
+                   "valid_to_unix_ms": vf - 1}),
+        )
+        .expect_err("inverting valid_to must be rejected");
+        assert!(err.contains("valid_from"), "got: {err}");
+        // Rejected BEFORE mutation: the old fact is not deprecated.
+        let status = db.get_entity("facts", "ended").unwrap().unwrap().status;
+        assert_eq!(status, "active", "rejected supersede must not mutate status");
+
+        // (b) Extension: valid_to after the already-stored close.
+        let err = handle_supersede(
+            &db,
+            json!({"from_category": "facts", "from_key": "ended",
+                   "to_category": "facts", "to_key": "successor",
+                   "valid_to_unix_ms": now}),
+        )
+        .expect_err("extending a closed period must be rejected");
+        assert!(err.contains("tighten"), "got: {err}");
+
+        // (c) Default-now supersede of the already-ended fact: succeeds and
+        // KEEPS the earlier close instead of extending it.
+        let r = handle_supersede(
+            &db,
+            json!({"from_category": "facts", "from_key": "ended",
+                   "to_category": "facts", "to_key": "successor"}),
+        )
+        .expect("default supersede");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(
+            v["from_valid_to_unix_ms"],
+            json!(vt),
+            "an ended fact must keep its earlier close: {r}"
+        );
+
+        // (d) Tightening to an earlier close is allowed.
+        let r = handle_supersede(
+            &db,
+            json!({"from_category": "facts", "from_key": "ended",
+                   "to_category": "facts", "to_key": "successor",
+                   "valid_to_unix_ms": vt - 10_000}),
+        )
+        .expect("tightening supersede");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["from_valid_to_unix_ms"], json!(vt - 10_000), "{r}");
 
         let _ = std::fs::remove_file(&path);
     }

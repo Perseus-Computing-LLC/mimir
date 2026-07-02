@@ -3482,13 +3482,46 @@ impl Database {
     /// stopped being true in the world. Used by mimir_supersede — superseding
     /// a fact ends its validity (at transaction time unless the caller says
     /// when). Does not touch the transaction axis.
-    pub fn set_valid_to(&self, id: &str, valid_to: i64) -> Result<(), Box<dyn std::error::Error>> {
+    ///
+    /// Conservative by construction (#363 review):
+    ///   * Refuses `valid_to <= valid_from` — an inverted period would shadow
+    ///     older versions in `bitemporal_at` while never matching itself,
+    ///     making the fact unanswerable.
+    ///   * Never EXTENDS an already-bounded valid_to — a fact that already
+    ///     ended stays ended (a default-now supersede must not retroactively
+    ///     revive it). Tightening (an earlier close) is allowed; when the
+    ///     stored close is already at-or-before the requested one, it is kept.
+    ///
+    /// Returns the EFFECTIVE close instant (the requested one, or the earlier
+    /// stored close that was kept).
+    pub fn set_valid_to(&self, id: &str, valid_to: i64) -> Result<i64, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
+        let (eff_from, cur_to): (i64, Option<i64>) = conn.query_row(
+            "SELECT COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
+                    valid_to_unix_ms \
+             FROM entities WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if valid_to <= eff_from {
+            return Err(format!(
+                "valid_to ({valid_to}) must be greater than the fact's valid_from ({eff_from}) — \
+                 refusing to invert the valid period"
+            )
+            .into());
+        }
+        if let Some(cur) = cur_to {
+            if cur <= valid_to {
+                // Already closed at or before the requested instant: keep the
+                // earlier close (never extend validity).
+                return Ok(cur);
+            }
+        }
         conn.execute(
             "UPDATE entities SET valid_to_unix_ms = ?1 WHERE id = ?2",
             params![valid_to, id],
         )?;
-        Ok(())
+        Ok(valid_to)
     }
 
     /// Find entities with identical (category, key) and merge/archive duplicates, keeping the newest.
@@ -6827,7 +6860,6 @@ pub(crate) fn sanitize_prompt_field(s: &str) -> String {
     s.replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Extract an Entity from a SQLite row, decrypting body_json if encryption is enabled.
 /// One version of a fact with its bi-temporal coordinates (#363): the entity
 /// content plus its application-time (valid_from/valid_to) and transaction-time
 /// (recorded_at/invalidated_at) periods. Returned by `valid_at`/`bitemporal_at`
@@ -6886,6 +6918,7 @@ pub fn valid_period_contains_instant(row_from: i64, row_to: Option<i64>, t: i64)
     row_from <= t && row_to.map_or(true, |rt| t < rt)
 }
 
+/// Extract an Entity from a SQLite row, decrypting body_json if encryption is enabled.
 fn entity_from_row(
     row: &rusqlite::Row,
     encryption: Option<&EncryptionManager>,
