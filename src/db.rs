@@ -6185,9 +6185,12 @@ Return a JSON object with an "insights" array. Each insight has:
     /// tombstone's prior digest). `as_of` at an instant inside the compacted
     /// window then returns this explicit marker instead of silently-wrong
     /// data; instants covered by surviving rows are answered exactly as
-    /// before. With tombstones disabled (`MIMIR_HISTORY_TOMBSTONES=0`) the
-    /// prefix is hard-deleted and as_of inside the window finds nothing —
-    /// the degenerate option-1 mode.
+    /// before. The tombstone's valid_from is the run's EARLIEST effective
+    /// valid_from (not first_recorded_at), so a retroactively-valid version's
+    /// window keeps answering `valid_at`/`bitemporal_at` with the marker
+    /// after compaction. With tombstones disabled
+    /// (`MIMIR_HISTORY_TOMBSTONES=0`) the prefix is hard-deleted and as_of
+    /// inside the window finds nothing — the degenerate option-1 mode.
     ///
     /// dry_run computes the identical eviction set and reports counts/bytes
     /// without mutating anything.
@@ -6223,6 +6226,12 @@ Return a JSON object with an "insights" array. Each insight has:
             ws: String,
             rec: i64,
             inv: i64,
+            /// Effective valid-time opening (COALESCE(valid_from, rec, created)).
+            /// The tombstone must carry the run's MINIMUM of these — a
+            /// retroactively-valid version opens its window before its
+            /// transaction time, and valid_at(past) must keep answering
+            /// (with the marker) after compaction.
+            vfrom: i64,
             bytes: i64,
             tomb: bool,
         }
@@ -6230,7 +6239,9 @@ Return a JSON object with an "insights" array. Each insight has:
             let mut stmt = tx.prepare(
                 "SELECT history_id, id, category, key, COALESCE(workspace_hash, ''), \
                         COALESCE(recorded_at_unix_ms, created_at_unix_ms), \
-                        invalidated_at_unix_ms, LENGTH(body_json), status \
+                        invalidated_at_unix_ms, \
+                        COALESCE(valid_from_unix_ms, recorded_at_unix_ms, created_at_unix_ms), \
+                        LENGTH(body_json), status \
                  FROM entity_history WHERE invalidated_at_unix_ms IS NOT NULL \
                  ORDER BY invalidated_at_unix_ms ASC, \
                           COALESCE(recorded_at_unix_ms, created_at_unix_ms) ASC",
@@ -6244,8 +6255,9 @@ Return a JSON object with an "insights" array. Each insight has:
                     ws: r.get(4)?,
                     rec: r.get(5)?,
                     inv: r.get(6)?,
-                    bytes: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                    tomb: r.get::<_, Option<String>>(8)?.as_deref() == Some("compacted"),
+                    vfrom: r.get(7)?,
+                    bytes: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    tomb: r.get::<_, Option<String>>(9)?.as_deref() == Some("compacted"),
                 })
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
@@ -6339,10 +6351,12 @@ Return a JSON object with an "insights" array. Each insight has:
             let mut versions: i64 = 0;
             let mut first_rec = i64::MAX;
             let mut last_inv = i64::MIN;
+            let mut first_vfrom = i64::MAX;
             for &i in &ev {
                 let r = &rows[i];
                 first_rec = first_rec.min(r.rec);
                 last_inv = last_inv.max(r.inv);
+                first_vfrom = first_vfrom.min(r.vfrom);
                 let body: String = tx.query_row(
                     "SELECT body_json FROM entity_history WHERE history_id = ?1",
                     params![r.history_id],
@@ -6389,16 +6403,21 @@ Return a JSON object with an "insights" array. Each insight has:
                     "digest": digest,
                     "first_recorded_at_unix_ms": first_rec,
                     "last_invalidated_at_unix_ms": last_inv,
+                    "first_valid_from_unix_ms": first_vfrom,
                     "compacted_at_unix_ms": now,
                 })
                 .to_string();
+                // valid_from = the run's EARLIEST effective valid_from — not
+                // first_rec: a retroactively-valid version (#398 rider) opens
+                // before its transaction time, and valid_at inside that
+                // window must return the marker, not None.
                 tx.execute(
                     "INSERT INTO entity_history \
                      (history_id, id, category, key, body_json, status, type, tags, source, \
                       workspace_hash, valid_from_unix_ms, recorded_at_unix_ms, \
                       invalidated_at_unix_ms, created_at_unix_ms, last_accessed_unix_ms) \
                      VALUES (?1, ?2, ?3, ?4, ?5, 'compacted', 'tombstone', '[]', \
-                             'history_retention', ?6, ?7, ?7, ?8, ?7, ?9)",
+                             'history_retention', ?6, ?10, ?7, ?8, ?7, ?9)",
                     params![
                         history_id,
                         newest.id,
@@ -6408,7 +6427,8 @@ Return a JSON object with an "insights" array. Each insight has:
                         newest.ws,
                         first_rec,
                         last_inv,
-                        now
+                        now,
+                        first_vfrom
                     ],
                 )?;
             }
@@ -16170,6 +16190,64 @@ mod tests {
             db.as_of("facts", "versioned-key", t_first).unwrap().is_none(),
             "hard-deleted window answers nothing"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// #398 rider (review-probed): a compacted version that was RETROACTIVELY
+    /// valid (valid_from in the far past) answered valid_at(past) before
+    /// compaction — so the tombstone must carry the run's earliest effective
+    /// valid_from, not first_recorded_at (transaction time), or the
+    /// valid-time axis silently loses the whole retroactive window and
+    /// valid_at(past) flips from "answer" to None with no marker.
+    #[test]
+    fn history_retention_tombstone_preserves_retroactive_valid_from() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let (db, path) = temp_db();
+        let vf = now_ms() - 30 * 86_400_000; // true since a month ago
+
+        db.remember_with_validity(
+            &make_entity("e-retro-1", "facts", "retro-key", r#"{"note":"retro v1"}"#),
+            Some(vf),
+            None,
+        )
+        .unwrap();
+        sleep(Duration::from_millis(3));
+        db.remember(&make_entity("e-retro-2", "facts", "retro-key", r#"{"note":"v2"}"#))
+            .unwrap();
+        sleep(Duration::from_millis(3));
+        db.remember(&make_entity("e-retro-3", "facts", "retro-key", r#"{"note":"v3"}"#))
+            .unwrap(); // history: h1 (retro v1, valid_from=vf), h2 (v2)
+
+        // Sanity: pre-compaction, the retroactive instant answers with v1.
+        let pre = db
+            .valid_at("facts", "retro-key", vf + 3_600_000)
+            .unwrap()
+            .expect("retroactive window must answer pre-compaction");
+        assert!(pre.entity.body_json.contains("retro v1"));
+
+        // Evict everything but the newest stored version (h1 goes).
+        let report = db
+            .enforce_history_retention(&retention_policy(None, Some(1), None, true), false)
+            .unwrap();
+        assert_eq!(report.rows_evicted, 1);
+        assert_eq!(report.tombstones_written, 1);
+
+        // The compacted window must still answer on the VALID-time axis —
+        // with the explicit marker, not None (pre-fix: tombstone valid_from
+        // was first_recorded_at, discarding vf, so this returned None).
+        let post = db
+            .valid_at("facts", "retro-key", vf + 3_600_000)
+            .unwrap()
+            .expect(
+                "valid_at inside a compacted retroactive window must return the \
+                 compacted marker, not None",
+            );
+        assert_eq!(post.entity.status, "compacted");
+        assert!(post.entity.body_json.contains("\"compacted\":true"));
+        // Strictly before the retroactive opening → still None (no window).
+        assert!(db.valid_at("facts", "retro-key", vf - 1).unwrap().is_none());
+
         let _ = fs::remove_file(&path);
     }
 

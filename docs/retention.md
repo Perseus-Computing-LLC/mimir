@@ -141,8 +141,12 @@ version count and a hash-chain digest of the evicted rows. `mimir_as_of` at
 an instant inside a compacted window returns an explicit
 `compacted: true` marker (with `versions_compacted` and `digest`) instead of
 silently-wrong data; instants covered by surviving versions are answered
-exactly as before. Successive passes merge tombstones (counts accumulate,
-digests chain).
+exactly as before. The same holds on the valid-time axis: `mimir_valid_at`
+and `mimir_bitemporal` inside a compacted window return the marker or
+nothing, never a wrong version — the tombstone keeps the run's earliest
+effective `valid_from`, so even retroactively-valid compacted versions keep
+their window answerable. Successive passes merge tombstones (counts
+accumulate, digests chain).
 
 `mimir_prune` with `scope: 'history'` enforces the same policy on demand
 (per-call overrides: `max_age_days`, `max_versions_per_key`, `max_bytes`) and

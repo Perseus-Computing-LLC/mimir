@@ -22,8 +22,13 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   counts accumulate, digests chain). `mimir_as_of` at an instant inside a
   compacted window returns an explicit marker (`compacted: true`,
   `versions_compacted`, `digest`) instead of silently-wrong data; instants
-  covered by surviving rows are answered exactly as before. Option 3
-  (export-then-delete to vault Markdown/JSONL) is deferred as a follow-up.
+  covered by surviving rows are answered exactly as before. The valid-time
+  axis holds too: the tombstone carries the run's earliest effective
+  `valid_from` (not first_recorded_at), so a retroactively-valid compacted
+  version's window keeps answering `mimir_valid_at`/`mimir_bitemporal` —
+  with the same explicit marker decoration — instead of flipping to None.
+  Option 3 (export-then-delete to vault Markdown/JSONL) is deferred as a
+  follow-up.
 - `mimir_prune` gains `scope: 'history'` (#398) with per-call bound overrides
   (`max_age_days`, `max_versions_per_key`, `max_bytes`) and dry_run
   preview — reports the exact rows + bytes the real run would evict.

@@ -935,22 +935,7 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
                 "entity_type": e.entity_type,
                 "as_of_unix_ms": as_of,
             });
-            // #398: the instant falls inside a retention-compacted window —
-            // surface an explicit marker (version count + roll-up digest from
-            // the tombstone body) instead of letting the synthetic row pass
-            // for a real version.
-            if e.status == "compacted" {
-                let marker: serde_json::Value =
-                    serde_json::from_str(&e.body_json).unwrap_or_default();
-                r["compacted"] = json!(true);
-                r["versions_compacted"] =
-                    marker.get("versions").cloned().unwrap_or(json!(null));
-                r["digest"] = marker.get("digest").cloned().unwrap_or(json!(null));
-                r["note"] = json!(
-                    "history inside this window was compacted by retention policy; \
-                     the original versions are not recoverable"
-                );
-            }
+            decorate_compacted_marker(&mut r, &e.status, &e.body_json);
             r
         }
         None => json!({
@@ -963,10 +948,30 @@ pub fn handle_as_of(db: &Database, args: Value) -> Result<String, String> {
     Ok(result.to_string())
 }
 
+/// #398: the returned version falls inside a retention-compacted window —
+/// surface an explicit marker (flag + version count + roll-up digest from the
+/// tombstone body) instead of letting the synthetic row pass for a real
+/// version. Shared by mimir_as_of, mimir_valid_at, and mimir_bitemporal so
+/// all three temporal axes decorate identically. No-op for real versions.
+fn decorate_compacted_marker(r: &mut serde_json::Value, status: &str, body_json: &str) {
+    if status != "compacted" {
+        return;
+    }
+    let marker: serde_json::Value = serde_json::from_str(body_json).unwrap_or_default();
+    r["compacted"] = json!(true);
+    r["versions_compacted"] = marker.get("versions").cloned().unwrap_or(json!(null));
+    r["digest"] = marker.get("digest").cloned().unwrap_or(json!(null));
+    r["note"] = json!(
+        "history inside this window was compacted by retention policy; \
+         the original versions are not recoverable"
+    );
+}
+
 /// Serialize a TemporalVersion into the shared found=true response shape used
-/// by mimir_valid_at and mimir_bitemporal (#363).
+/// by mimir_valid_at and mimir_bitemporal (#363). Tombstone versions carry
+/// the #398 compacted-marker decoration.
 fn temporal_version_json(v: &crate::db::TemporalVersion) -> serde_json::Value {
-    json!({
+    let mut r = json!({
         "found": true,
         "id": v.entity.id,
         "category": v.entity.category,
@@ -979,7 +984,9 @@ fn temporal_version_json(v: &crate::db::TemporalVersion) -> serde_json::Value {
         "recorded_at_unix_ms": v.recorded_at_unix_ms,
         "invalidated_at_unix_ms": v.invalidated_at_unix_ms,
         "is_live_version": v.invalidated_at_unix_ms.is_none(),
-    })
+    });
+    decorate_compacted_marker(&mut r, &v.entity.status, &v.entity.body_json);
+    r
 }
 
 /// #363: mimir_valid_at — the valid-time axis. "What was actually true in the
@@ -4523,6 +4530,48 @@ mod tests {
         assert_eq!(v["status"], json!("compacted"));
         assert_eq!(v["versions_compacted"].as_i64().unwrap(), 2);
         assert_eq!(v["digest"].as_str().unwrap().len(), 16);
+        assert!(v["note"].as_str().unwrap().contains("not recoverable"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #398 rider: the valid-time tools decorate a compacted-window answer
+    /// with the same explicit marker as mimir_as_of — a retroactively-valid
+    /// version's window keeps answering after compaction.
+    #[test]
+    fn valid_at_tool_surfaces_compacted_marker_for_retroactive_window() {
+        let (db, path) = temp_db();
+        let vf = now_ms() - 30 * 86_400_000;
+        handle_remember(
+            &db,
+            json!({"category": "facts", "key": "retro398", "valid_from_unix_ms": vf,
+                   "body_json": "{\"note\":\"retro v1\"}"}),
+        )
+        .expect("remember retroactive v1");
+        for i in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            handle_remember(
+                &db,
+                json!({"category": "facts", "key": "retro398",
+                       "body_json": format!("{{\"note\":\"v{}\"}}", i + 2)}),
+            )
+            .expect("supersede");
+        }
+        handle_prune(
+            &db,
+            json!({"scope": "history", "max_versions_per_key": 1}),
+        )
+        .expect("compact");
+
+        let resp = handle_valid_at(
+            &db,
+            json!({"category": "facts", "key": "retro398", "valid_at_unix_ms": vf + 1000}),
+        )
+        .expect("valid_at");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["found"], json!(true), "compacted window must answer: {resp}");
+        assert_eq!(v["compacted"], json!(true));
+        assert_eq!(v["status"], json!("compacted"));
+        assert!(v["versions_compacted"].as_i64().unwrap() >= 1);
         assert!(v["note"].as_str().unwrap().contains("not recoverable"));
         let _ = std::fs::remove_file(&path);
     }
