@@ -2868,14 +2868,19 @@ impl Database {
         conn: &rusqlite::Connection,
         category: &str,
         key: &str,
-    ) -> Option<String> {
-        conn.query_row(
+    ) -> rusqlite::Result<Option<String>> {
+        // #394: only "no rows" maps to None — a real rusqlite error (locked
+        // DB, corruption) must propagate, not masquerade as "not found".
+        match conn.query_row(
             "SELECT id FROM entities WHERE category = ?1 AND key = ?2 \
              ORDER BY workspace_hash ASC, id ASC LIMIT 1",
             params![category, key],
             |r| r.get(0),
-        )
-        .ok()
+        ) {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Create a link from one entity to another.
@@ -2890,8 +2895,8 @@ impl Database {
         // Verify both entities exist (id resolution only — ids are immutable,
         // so these reads don't need the writer lock; and they run on THIS
         // connection, see resolve_entity_id / #387).
-        let from_id =
-            Self::resolve_entity_id(&conn, from_category, from_key).ok_or("Source entity not found")?;
+        let from_id = Self::resolve_entity_id(&conn, from_category, from_key)?
+            .ok_or("Source entity not found")?;
         let _to: String = conn
             .query_row(
                 "SELECT id FROM entities WHERE id = ?1",
@@ -2942,7 +2947,7 @@ impl Database {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         // #387: id resolution on the already-held connection — see link().
-        let from_id = Self::resolve_entity_id(&conn, from_category, from_key)
+        let from_id = Self::resolve_entity_id(&conn, from_category, from_key)?
             .ok_or("Source entity not found")?;
 
         // #382: same writer-lock discipline as link() — an unlink racing a
@@ -4293,20 +4298,28 @@ impl Database {
         // family; the not-found early return drops the tx (rollback).
         let tx = Self::audited_write_tx(&conn)?;
 
-        let existing: Option<(i64, i64)> = tx
+        // #391: pin the write to ONE resolved row. (category, key) is not an
+        // identity since #339 — the same key can exist per workspace — and the
+        // old key-addressed UPDATE stamped one workspace's counts and
+        // efficacy_status onto every workspace's row (and archived rows).
+        // Same deterministic pick as get_entity/resolve_entity_id, restricted
+        // to live rows.
+        let existing: Option<(String, i64, i64)> = tx
             .query_row(
-                "SELECT follow_count, miss_count FROM entities WHERE category = ?1 AND key = ?2 AND archived = 0",
+                "SELECT id, follow_count, miss_count FROM entities \
+                 WHERE category = ?1 AND key = ?2 AND archived = 0 \
+                 ORDER BY workspace_hash ASC, id ASC LIMIT 1",
                 params![category, key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .ok();
 
-        let (follow_count, miss_count) = match existing {
-            Some((f, m)) => {
+        let (target_id, follow_count, miss_count) = match existing {
+            Some((id, f, m)) => {
                 if followed {
-                    (f + 1, m)
+                    (id, f + 1, m)
                 } else {
-                    (f, m + 1)
+                    (id, f, m + 1)
                 }
             }
             None => {
@@ -4344,15 +4357,8 @@ impl Database {
 
         tx.execute(
             "UPDATE entities SET follow_count = ?1, miss_count = ?2, follow_rate = ?3, \
-             efficacy_status = ?4 WHERE category = ?5 AND key = ?6",
-            params![
-                follow_count,
-                miss_count,
-                follow_rate,
-                efficacy_status,
-                category,
-                key
-            ],
+             efficacy_status = ?4 WHERE id = ?5",
+            params![follow_count, miss_count, follow_rate, efficacy_status, target_id],
         )?;
         tx.commit()?;
 
@@ -4915,10 +4921,13 @@ impl Database {
                         fnv1a64(&format!("{}:{}", insight_type, source_ids.join(",")));
                     let key = format!("dream-{:016x}", evidence_hash);
 
-                    if let Some(existing) = self.get_entity("insight", &key)? {
+                    // #394: dedup needs only the id — resolve it on the
+                    // connection this loop already holds instead of drawing a
+                    // second pooled connection per cluster (#387 shape).
+                    if let Some(existing_id) = Self::resolve_entity_id(&conn, "insight", &key)? {
                         report.insights_deduped += 1;
                         report.insights.push(crate::models::DreamInsight {
-                            entity_id: existing.id,
+                            entity_id: existing_id,
                             key,
                             summary,
                             insight_type,
@@ -13134,6 +13143,47 @@ mod tests {
             "lost follow increments under concurrency"
         );
         assert!((rate - 1.0).abs() < 1e-9, "follow_rate must be 1.0, got {rate}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn follow_scopes_to_one_resolved_row_not_every_workspace() {
+        // #391: (category, key) is per-workspace identity since #339. follow()
+        // must stamp counts/efficacy onto exactly the one deterministically
+        // resolved live row (the get_entity pick: '' first, then
+        // lexicographically-first workspace) — not every workspace's row of
+        // the same key, and never archived rows.
+        let (db, path) = temp_db();
+        let mut a = make_entity("f-ws-a", "convention", "shared-rule", r#"{"rule":"a"}"#);
+        a.workspace_hash = "aaaa".to_string();
+        db.remember_skip_dedup(&a).unwrap();
+        let mut b = make_entity("f-ws-b", "convention", "shared-rule", r#"{"rule":"b"}"#);
+        b.workspace_hash = "bbbb".to_string();
+        db.remember_skip_dedup(&b).unwrap();
+
+        let r = db.follow("convention", "shared-rule", true).unwrap();
+        assert!(r.found);
+        assert_eq!(r.follow_count, 1);
+
+        let conn = db.conn().unwrap();
+        let count_of = |id: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT follow_count, miss_count FROM entities WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count_of("f-ws-a"),
+            (1, 0),
+            "the resolved row (lexicographically-first workspace) takes the follow"
+        );
+        assert_eq!(
+            count_of("f-ws-b"),
+            (0, 0),
+            "the other workspace's row of the same key must be untouched"
+        );
         let _ = fs::remove_file(&path);
     }
 
