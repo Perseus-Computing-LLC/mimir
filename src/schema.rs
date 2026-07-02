@@ -387,10 +387,22 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // separate point query ONLY for the rare candidate that survives both
     // lossless prunes. WITHOUT ROWID: the entity_id probes hit one clustered
     // b-tree instead of autoindex-then-rowid double lookups.
+    //
+    // Freshness guard = (body_len, body_hash): a signature is trusted only
+    // while BOTH match the stored body. Length alone cannot catch a
+    // same-length rewrite by a signature-unaware writer — which is exactly
+    // what a rolled-back pre-v10 binary produces (it rewrites body_json
+    // without touching these tables; AES-GCM re-encryption even preserves
+    // ciphertext length). With the hash, such rows read as stale, fall back
+    // to the exact rebuild path (identical verdicts), and self-heal on the
+    // next dedup touch — so v10 stores stay ROLLBACK-SAFE: running an older
+    // binary never poisons dedup verdicts, and dropping both side tables is
+    // always a safe reset (they hold only derived, rebuildable data).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS dedup_signatures (
             entity_id TEXT PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
             body_len INTEGER NOT NULL,
+            body_hash INTEGER NOT NULL,
             tg_count INTEGER NOT NULL,
             histo BLOB
          ) WITHOUT ROWID;
@@ -1267,7 +1279,7 @@ mod tests {
 
         assert!(
             conn.prepare(
-                "SELECT entity_id, body_len, tg_count, histo FROM dedup_signatures LIMIT 1"
+                "SELECT entity_id, body_len, body_hash, tg_count, histo \n                 FROM dedup_signatures LIMIT 1"
             )
             .is_ok(),
             "dedup_signatures with all v10 columns must exist"

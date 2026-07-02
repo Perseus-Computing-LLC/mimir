@@ -2056,13 +2056,13 @@ impl Database {
         // single-table scan's.
         let mut stmt = if match_query.is_empty() {
             conn.prepare(
-                "SELECT e.id, e.body_json, s.body_len, s.tg_count, s.histo \
+                "SELECT e.id, e.body_json, s.body_len, s.body_hash, s.tg_count, s.histo \
                  FROM entities e LEFT JOIN dedup_signatures s ON s.entity_id = e.id \
                  WHERE e.category = ?1 AND e.workspace_hash = ?2 AND e.archived = 0",
             )?
         } else {
             conn.prepare(
-                "SELECT e.id, e.body_json, s.body_len, s.tg_count, s.histo \
+                "SELECT e.id, e.body_json, s.body_len, s.body_hash, s.tg_count, s.histo \
                  FROM entities e LEFT JOIN dedup_signatures s ON s.entity_id = e.id \
                  WHERE e.category = ?1 AND e.workspace_hash = ?2 AND e.archived = 0 \
                    AND e.rowid IN (SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?3)",
@@ -2099,11 +2099,19 @@ impl Database {
             // the small meta columns ride the scan; the multi-KB exact set
             // lives in dedup_signature_blobs and is point-fetched only for
             // candidates that survive both prunes.
-            let meta: Option<usize> = match (row.get_ref(2)?, row.get_ref(3)?) {
+            let meta: Option<usize> = match (row.get_ref(2)?, row.get_ref(3)?, row.get_ref(4)?) {
                 (
                     rusqlite::types::ValueRef::Integer(body_len),
+                    rusqlite::types::ValueRef::Integer(body_hash),
                     rusqlite::types::ValueRef::Integer(tg_count),
-                ) if body_len == existing_body.len() as i64 && tg_count >= 0 => {
+                ) if body_len == existing_body.len() as i64
+                    && tg_count >= 0
+                    // Exact half of the guard, checked after the free length
+                    // compare: a same-length rewrite by a signature-unaware
+                    // writer (rolled-back pre-v10 binary, direct SQL) leaves
+                    // the length intact but never the content hash.
+                    && body_hash == crate::dedup::body_hash64(existing_body) =>
+                {
                     Some(tg_count as usize)
                 }
                 _ => None,
@@ -2147,7 +2155,7 @@ impl Database {
                         // Lossless histogram ceiling on the intersection
                         // (Σ min of bucket counts — see dedup::histogram);
                         // clamped by min(a,b), the other valid ceiling.
-                        let histo_ok = match (&target_histo, row.get_ref(4)?) {
+                        let histo_ok = match (&target_histo, row.get_ref(5)?) {
                             (Some(th), rusqlite::types::ValueRef::Blob(ch))
                                 if ch.len() == th.len() =>
                             {
@@ -2271,21 +2279,54 @@ impl Database {
         if pending.is_empty() {
             return;
         }
-        let Ok(tx) = conn.unchecked_transaction() else {
+        // LAST-WRITER RACE (review defect on #392): this flush runs AFTER
+        // the scan that rebuilt these signatures, so a remember() update can
+        // commit a new body + fresh signature for the same row in between.
+        // An unconditional INSERT OR REPLACE landing last would overwrite
+        // the fresh signature with one describing the OLD body — and since
+        // the old and new bodies can share a byte length, the stale
+        // signature would then be trusted (no self-heal) and silently
+        // change verdicts. Two-part fix: BEGIN IMMEDIATE takes the write
+        // lock FIRST (a racing writer either committed before — we see its
+        // body below and skip — or blocks until we commit and then
+        // overwrites us: the correct last-writer order), and each row is
+        // re-verified against the CURRENT stored body (length + content
+        // hash) under that lock before anything is written.
+        if conn.execute_batch("BEGIN IMMEDIATE;").is_err() {
             return;
-        };
+        }
         for (id, rs) in pending {
-            let _ = tx.execute(
+            // Only write if the row still stores the exact body this
+            // signature was built from; a rewrite that committed after our
+            // scan wins (its transaction already carries the fresh
+            // signature).
+            let unchanged = conn
+                .query_row(
+                    "SELECT body_json FROM entities WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, String>(0),
+                )
+                .map(|b| {
+                    b.len() as i64 == rs.body_len
+                        && crate::dedup::body_hash64(&b) == rs.body_hash
+                })
+                .unwrap_or(false);
+            if !unchanged {
+                continue;
+            }
+            let _ = conn.execute(
                 "INSERT OR REPLACE INTO dedup_signature_blobs (entity_id, sig) VALUES (?1, ?2)",
                 params![id, rs.sig],
             );
-            let _ = tx.execute(
+            let _ = conn.execute(
                 "INSERT OR REPLACE INTO dedup_signatures \
-                 (entity_id, body_len, tg_count, histo) VALUES (?1, ?2, ?3, ?4)",
-                params![id, rs.body_len, rs.tg_count, rs.histo],
+                 (entity_id, body_len, body_hash, tg_count, histo) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo],
             );
         }
-        let _ = tx.commit();
+        if conn.execute_batch("COMMIT;").is_err() {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
     }
 
     /// Upsert the stored dedup signature for `entity_id`, derived from the
@@ -2313,8 +2354,8 @@ impl Database {
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO dedup_signatures \
-             (entity_id, body_len, tg_count, histo) VALUES (?1, ?2, ?3, ?4)",
-            params![entity_id, rs.body_len, rs.tg_count, rs.histo],
+             (entity_id, body_len, body_hash, tg_count, histo) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![entity_id, rs.body_len, rs.body_hash, rs.tg_count, rs.histo],
         )?;
         Ok(())
     }
@@ -11550,7 +11591,13 @@ mod tests {
         let threshold = 0.7;
         let mut boundary_hits = 0usize;
 
-        for seed in 0..8u64 {
+        // Seed count is env-tunable so review/CI can run a wider sweep
+        // (e.g. MIMIR_DEDUP_PROP_SEEDS=50) without slowing the default suite.
+        let seeds: u64 = std::env::var("MIMIR_DEDUP_PROP_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        for seed in 0..seeds {
             let mut rng = XorShift::new(seed + 1);
             let category = format!("prop-{seed}");
             let conn = db.conn().unwrap();
@@ -11763,6 +11810,125 @@ mod tests {
             sig,
             crate::dedup::build_row_signature(body).sig,
             "malformed signature must be repaired"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // #392 review defect 1 (lazy-backfill flush race): a scan on connection A
+    // rebuilds a signature for row X, but before A's write-back lands, a
+    // remember() update rewrites X to a DIFFERENT body of the SAME byte
+    // length and commits row + fresh signature atomically. A's stale flush
+    // arrives LAST and must LOSE — an unconditional INSERT OR REPLACE would
+    // overwrite the fresh signature with one describing the old body, and
+    // with body_len still matching, the stale signature would be trusted
+    // forever (no self-heal), silently changing dedup verdicts.
+    #[test]
+    fn dedup_sig_backfill_flush_loses_to_concurrent_rewrite() {
+        let (db, path) = temp_db();
+        let threshold = 0.7;
+        let conn = db.conn().unwrap();
+        // Same byte length, very different trigram content.
+        let body_old = r#"{"note":"alpha bravo charlie delta echo foxtrot golf"}"#;
+        let body_new = r#"{"memo":"zulu yankee xray whiskey victor uniform tan"}"#;
+        assert_eq!(body_old.len(), body_new.len(), "precondition: same-length bodies");
+
+        db.remember_skip_dedup(&make_entity("race-1", "note", "race-k", body_old))
+            .unwrap();
+        // The interleaved update: rewrites the row to body_new, committing the
+        // fresh signature in the same transaction.
+        db.remember_skip_dedup(&make_entity("race-1b", "note", "race-k", body_new))
+            .unwrap();
+
+        // Connection A's delayed flush, carrying the signature it rebuilt
+        // from the OLD body during its (now outdated) scan.
+        Database::flush_dedup_sig_backfill(
+            &conn,
+            &[("race-1".to_string(), crate::dedup::build_row_signature(body_old))],
+        );
+
+        // The fresh signature must have survived.
+        let sig: Vec<u8> = conn
+            .query_row(
+                "SELECT sig FROM dedup_signature_blobs WHERE entity_id='race-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sig,
+            crate::dedup::build_row_signature(body_new).sig,
+            "a stale delayed flush must not overwrite a fresh signature"
+        );
+
+        // And the verdict for a near-duplicate of the CURRENT body must match
+        // the exhaustive reference (pre-fix: signature described body_old, so
+        // the new path missed the near-duplicate the old scan finds).
+        let probe = {
+            let mut p: Vec<char> = body_new.chars().collect();
+            let last = p.len() - 3;
+            p[last] = 'q';
+            p.into_iter().collect::<String>()
+        };
+        let want = reference_find_near_duplicate(&conn, "note", "", &probe, threshold, false);
+        assert!(want.is_some(), "precondition: probe is a genuine near-duplicate");
+        assert_eq!(
+            db.find_near_duplicate("note", "", &probe, threshold, false).unwrap(),
+            want,
+            "verdict after a lost flush race must match the exhaustive scan"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // #392 review defect 2 (rollback safety): a pre-v10 binary running
+    // against a v10 store rewrites body_json without touching the signature
+    // tables. If the rewrite preserves the byte length, a length-only
+    // freshness guard cannot detect the stale signature — the content hash
+    // must catch it, fall back to the rebuild path (same verdict as the
+    // exhaustive scan), and repair the signature in place.
+    #[test]
+    fn dedup_sig_hash_guard_catches_same_length_rewrite() {
+        let (db, path) = temp_db();
+        let threshold = 0.7;
+        let conn = db.conn().unwrap();
+        let body_old = r#"{"note":"alpha bravo charlie delta echo foxtrot golf"}"#;
+        let body_new = r#"{"memo":"zulu yankee xray whiskey victor uniform tan"}"#;
+        assert_eq!(body_old.len(), body_new.len(), "precondition: same-length bodies");
+
+        db.remember_skip_dedup(&make_entity("rb-1", "note", "rb-1", body_old)).unwrap();
+        // Simulate the old binary: direct row rewrite, signature untouched.
+        conn.execute(
+            "UPDATE entities SET body_json = ?1 WHERE id = 'rb-1'",
+            params![body_new],
+        )
+        .unwrap();
+
+        // Near-duplicate of the CURRENT body: the stale signature (built from
+        // body_old, same length) must not be trusted.
+        let probe = {
+            let mut p: Vec<char> = body_new.chars().collect();
+            let last = p.len() - 3;
+            p[last] = 'q';
+            p.into_iter().collect::<String>()
+        };
+        let want = reference_find_near_duplicate(&conn, "note", "", &probe, threshold, false);
+        assert!(want.is_some(), "precondition: probe is a genuine near-duplicate");
+        assert_eq!(
+            db.find_near_duplicate("note", "", &probe, threshold, false).unwrap(),
+            want,
+            "same-length rewrite by a signature-unaware writer must not change verdicts"
+        );
+        // And the guard's fallback must have repaired the signature.
+        let sig: Vec<u8> = conn
+            .query_row(
+                "SELECT sig FROM dedup_signature_blobs WHERE entity_id='rb-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sig,
+            crate::dedup::build_row_signature(body_new).sig,
+            "stale same-length signature must be repaired after detection"
         );
         let _ = fs::remove_file(&path);
     }

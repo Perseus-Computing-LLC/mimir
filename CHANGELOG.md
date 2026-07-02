@@ -126,7 +126,15 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   (randomized property-tested against the old implementation, including
   threshold-boundary, tiny-body, unicode and encrypted stores). Existing
   rows need no migration pass: unsigned rows take the old rebuild path and
-  are backfilled lazily in bounded batches (512/scan). Measured (release,
+  are backfilled lazily in bounded batches (512/scan). A signature is
+  trusted only while BOTH the stored body's byte length and a stable
+  64-bit content hash still match, so same-length rewrites by
+  signature-unaware writers — e.g. a rolled-back pre-v10 binary running
+  against a v10 store — read as stale and self-heal instead of poisoning
+  verdicts (rollback-safe; dropping the two side tables is also always a
+  safe reset). The lazy write-back re-verifies the row's current body
+  under the write lock before landing, so a backfill can never overwrite
+  the fresher signature a concurrent update just committed. Measured (release,
   1KB uniform-length bodies — the length prefilter's worst case; medians
   over 15 probes): single-insert dedup scan @50k 1628.5ms → 69.3ms
   (23.5x); bulk import of 5,000 (fresh store, dedup ON) 123.6s (pre, per

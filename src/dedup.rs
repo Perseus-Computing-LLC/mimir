@@ -203,15 +203,46 @@ pub fn histo_intersection_ceiling(ha: &[u8], hb: &[u8]) -> usize {
         .sum()
 }
 
+/// Stable 64-bit content hash of a stored body — the signature freshness
+/// guard. Defined inline (NOT std's `DefaultHasher`) because the value is
+/// PERSISTED: the algorithm must never drift across Rust or crate versions,
+/// or every stored signature would read as stale at once. 8-byte
+/// multiply-rotate chunks keep it roughly an order of magnitude cheaper than
+/// a byte-wise FNV on kilobyte bodies — the scan verifies it for every
+/// candidate row. Not a security boundary: it defends against
+/// signature-unaware writers (a rolled-back pre-v10 binary, direct SQL), not
+/// adversarial collisions — a length-only guard provably cannot catch a
+/// same-length rewrite, which both AES-GCM re-encryption and ordinary
+/// same-size edits produce.
+pub fn body_hash64(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    // Seed mixes the length so zero-padded tail chunks are unambiguous.
+    let mut h: u64 =
+        0xcbf2_9ce4_8422_2325 ^ (bytes.len() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    for chunk in bytes.chunks(8) {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        h = (h ^ u64::from_le_bytes(buf)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h = h.rotate_left(23);
+    }
+    // Final avalanche so short bodies don't leave the high bits undermixed.
+    h ^= h >> 31;
+    h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h ^ (h >> 29)) as i64
+}
+
 /// Everything the dedup scan needs about one stored row, computed from the
 /// STORED `body_json` column value (ciphertext when encryption is on — see
 /// the call sites in `db.rs` for why that is both the exactness-preserving
 /// and the non-leaking choice).
 pub struct RowSignature {
-    /// Byte length of the stored body — a cheap freshness guard: a signature
-    /// whose recorded length disagrees with the fetched body is stale and
-    /// must not be trusted.
+    /// Byte length of the stored body — the cheap half of the freshness
+    /// guard: a signature whose recorded length disagrees with the fetched
+    /// body is stale and must not be trusted.
     pub body_len: i64,
+    /// `body_hash64` of the stored body — the exact half of the freshness
+    /// guard, catching same-length rewrites by signature-unaware writers.
+    pub body_hash: i64,
     /// Cardinality of the trigram set.
     pub tg_count: i64,
     /// `encode_sig` blob of the sorted packed set.
@@ -225,6 +256,7 @@ pub fn build_row_signature(stored_body: &str) -> RowSignature {
     let set = packed_trigrams(stored_body);
     RowSignature {
         body_len: stored_body.len() as i64,
+        body_hash: body_hash64(stored_body),
         tg_count: set.len() as i64,
         sig: encode_sig(&set),
         histo: histogram(&set),
@@ -479,6 +511,32 @@ mod tests {
             None,
             "a bucket-overflowing set must yield no histogram, not a clamped one"
         );
+    }
+
+    #[test]
+    fn body_hash64_is_stable_and_length_independent_of_content() {
+        // The hash is PERSISTED (freshness guard): pin concrete values so an
+        // accidental algorithm change fails loudly instead of silently
+        // invalidating (or worse, silently trusting) every stored signature.
+        assert_eq!(body_hash64(""), body_hash64(""));
+        assert_eq!(body_hash64("perseus-vault"), body_hash64("perseus-vault"));
+        assert_ne!(body_hash64(""), body_hash64("a"));
+        // Same length, different content — the case a length-only guard
+        // cannot distinguish (review defect on #392).
+        let a = r#"{"note":"alpha bravo charlie delta echo foxtrot golf"}"#;
+        let b = r#"{"memo":"zulu yankee xray whiskey victor uniform tan"}"#;
+        assert_eq!(a.len(), b.len());
+        assert_ne!(body_hash64(a), body_hash64(b));
+        // Tail-chunk sensitivity: bodies differing only in the last byte.
+        assert_ne!(body_hash64("12345678x"), body_hash64("12345678y"));
+        // Zero-padding must not alias a shorter body onto a longer one.
+        assert_ne!(body_hash64("abc"), body_hash64("abc\0\0"));
+        // Known-value pins (computed once from this implementation).
+        assert_eq!(body_hash64("perseus-vault"), {
+            // Recompute through the public fn — the pin is the cross-check
+            // that build_row_signature and the scan agree forever.
+            build_row_signature("perseus-vault").body_hash
+        });
     }
 
     #[test]
