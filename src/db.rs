@@ -2857,6 +2857,27 @@ impl Database {
         Ok(affected > 0)
     }
 
+    /// Resolve the id that link()/unlink() operate on, on the CALLER's
+    /// connection. Mirrors get_entity's deterministic multi-workspace pick
+    /// (#342: global '' row first, then lexicographically-first workspace)
+    /// without drawing a SECOND pooled connection while the first is held —
+    /// that nested draw let >= pool-size concurrent linkers starve the pool
+    /// into r2d2 acquire timeouts (#387) — and without decrypting the body,
+    /// which id resolution never needed.
+    fn resolve_entity_id(
+        conn: &rusqlite::Connection,
+        category: &str,
+        key: &str,
+    ) -> Option<String> {
+        conn.query_row(
+            "SELECT id FROM entities WHERE category = ?1 AND key = ?2 \
+             ORDER BY workspace_hash ASC, id ASC LIMIT 1",
+            params![category, key],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
     /// Create a link from one entity to another.
     pub fn link(
         &self,
@@ -2867,10 +2888,10 @@ impl Database {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         // Verify both entities exist (id resolution only — ids are immutable,
-        // so these reads don't need the writer lock).
-        let from = self
-            .get_entity(from_category, from_key)?
-            .ok_or("Source entity not found")?;
+        // so these reads don't need the writer lock; and they run on THIS
+        // connection, see resolve_entity_id / #387).
+        let from_id =
+            Self::resolve_entity_id(&conn, from_category, from_key).ok_or("Source entity not found")?;
         let _to: String = conn
             .query_row(
                 "SELECT id FROM entities WHERE id = ?1",
@@ -2888,7 +2909,7 @@ impl Database {
         let links_str: String = tx
             .query_row(
                 "SELECT links FROM entities WHERE id = ?1",
-                params![from.id],
+                params![from_id],
                 |r| r.get(0),
             )
             .unwrap_or_else(|_| "[]".to_string());
@@ -2905,7 +2926,7 @@ impl Database {
         let new_links = serde_json::to_string(&links)?;
         tx.execute(
             "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
-            params![new_links, now_ms(), from.id],
+            params![new_links, now_ms(), from_id],
         )?;
         tx.commit()?;
 
@@ -2920,8 +2941,8 @@ impl Database {
         to_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        let from = self
-            .get_entity(from_category, from_key)?
+        // #387: id resolution on the already-held connection — see link().
+        let from_id = Self::resolve_entity_id(&conn, from_category, from_key)
             .ok_or("Source entity not found")?;
 
         // #382: same writer-lock discipline as link() — an unlink racing a
@@ -2930,7 +2951,7 @@ impl Database {
         let tx = Self::audited_write_tx(&conn)?;
         let links_str: String = tx.query_row(
             "SELECT links FROM entities WHERE id = ?1",
-            params![from.id],
+            params![from_id],
             |r| r.get(0),
         )?;
 
@@ -2945,7 +2966,7 @@ impl Database {
         let new_links = serde_json::to_string(&links)?;
         tx.execute(
             "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
-            params![new_links, now_ms(), from.id],
+            params![new_links, now_ms(), from_id],
         )?;
         tx.commit()?;
 
@@ -6287,8 +6308,13 @@ last_accessed: {}
         }
 
         // Wrap all mutations in a transaction so partial writes are not left
-        // behind if any step fails (cohere runs multiple statements on self.conn).
-        conn.execute("BEGIN IMMEDIATE", [])?;
+        // behind if any step fails. A drop-safe Transaction, NOT a raw
+        // "BEGIN IMMEDIATE" execute: any `?` error between a raw BEGIN and
+        // its COMMIT returned this pooled connection with the transaction
+        // still open, so the next checkout of that connection failed with
+        // "cannot start a transaction within a transaction" — one failed
+        // cohere run poisoned that pool slot permanently (#388).
+        let tx = Self::audited_write_tx(&conn)?;
         // Default promotion threshold matches the recall path's
         // WORKING_THRESHOLD so buffer→working promotion happens at the same
         // retrieval count everywhere. Previously cohere promoted at a literal
@@ -6300,7 +6326,7 @@ last_accessed: {}
         } else {
             Self::WORKING_THRESHOLD
         };
-        promoted = conn.execute(
+        promoted = tx.execute(
             "UPDATE entities SET layer = 'working' WHERE layer = 'buffer' AND retrieval_count >= ?1",
             params![promote_threshold],
         )? as i64;
@@ -6310,12 +6336,12 @@ last_accessed: {}
         // so repeated standalone cohere calls can't walk them below the
         // archive threshold (#298). Without the floor, ~59 cohere calls
         // (0.95^59 ≈ 0.048) archived every unboosted entity, verified included.
-        let decayed_count: i64 = conn.query_row(
+        let decayed_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM entities WHERE archived = 0 AND decay_score > 0.01",
             [],
             |r| r.get(0),
         )?;
-        conn.execute(
+        tx.execute(
             &format!(
                 "UPDATE entities SET decay_score = \
                  MAX(decay_score * 0.95, \
@@ -6349,7 +6375,7 @@ last_accessed: {}
         let mut pending: std::collections::HashMap<String, Vec<MemoryLink>> =
             std::collections::HashMap::new();
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT e1.id, e1.links, e2.id as e2_id, e1.body_json, e2.body_json
                  FROM entities e1
                  JOIN entities e2 ON e1.category = e2.category AND e1.id < e2.id
@@ -6417,7 +6443,7 @@ last_accessed: {}
         let link_ts = now_ms();
         for (id, links) in &pending {
             let new_links = serde_json::to_string(links)?;
-            conn.execute(
+            tx.execute(
                 "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
                 params![new_links, link_ts, id],
             )?;
@@ -6432,7 +6458,7 @@ last_accessed: {}
         } else {
             Self::ARCHIVE_DECAY_THRESHOLD
         };
-        archived = conn.execute(
+        archived = tx.execute(
             "UPDATE entities SET archived = 1, archive_reason = 'auto-archived by coherence daemon (decay < threshold)'
              WHERE archived = 0 AND verified = 0 AND decay_score < ?1",
             params![archive_threshold],
@@ -6440,13 +6466,13 @@ last_accessed: {}
 
         // Clean FTS5 entries for archived entities
         if archived > 0 {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM entities_fts WHERE rowid IN (SELECT rowid FROM entities WHERE archived = 1)",
                 [],
             )?;
         }
 
-        conn.execute("COMMIT", [])?;
+        tx.commit()?;
 
         Ok(crate::models::CohereReport {
             promoted,
@@ -8120,6 +8146,50 @@ mod tests {
                 .map(|l| l.target_id.as_str())
                 .collect::<Vec<_>>()
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn many_concurrent_linkers_do_not_starve_the_pool() {
+        // #387: link() resolved the source entity via get_entity(), which
+        // draws a SECOND pooled connection while the first is held. With
+        // pool max 16, >= 16 concurrent linkers each held one connection and
+        // blocked on the nested draw — r2d2 acquire timeout (~30s) and an
+        // opaque Error(None) instead of a link. Ids are now resolved on the
+        // caller's own connection, so 3x-pool-size linkers must all succeed.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-387", "facts", "src387", r#"{"n":"v0"}"#))
+            .unwrap();
+        const LINKERS: usize = 48;
+        for i in 0..LINKERS {
+            db.remember_skip_dedup(&make_entity(
+                &format!("t-387-{i}"),
+                "facts",
+                &format!("tgt387-{i}"),
+                r#"{"n":"t"}"#,
+            ))
+            .unwrap();
+        }
+
+        let db = Arc::new(db);
+        let handles: Vec<_> = (0..LINKERS)
+            .map(|i| {
+                let db = Arc::clone(&db);
+                thread::spawn(move || {
+                    db.link("facts", "src387", &format!("t-387-{i}"), "related")
+                        .expect("link must not starve the pool");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let live = db.get_entity("facts", "src387").unwrap().unwrap();
+        assert_eq!(live.links.len(), LINKERS, "every edge must land");
         let _ = fs::remove_file(&path);
     }
 
