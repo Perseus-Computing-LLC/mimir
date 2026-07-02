@@ -2,11 +2,11 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Perseus-Computing-LLC/mimir",
   "title": "Perseus Vault (formerly Mimir/Mneme), persistent memory engine for AI agents",
-  "description": "Local-first MCP memory server: SQLite, FTS5 and vector search, AES-256-GCM. 46 tools, no cloud.",
-  "version": "2.9.0",
+  "description": "Local-first MCP memory server: SQLite, FTS5 and vector search, AES-256-GCM. 49 tools, no cloud.",
+  "version": "2.13.0",
   "packages": [{
     "registryType": "oci",
-    "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.9.0",
+    "identifier": "ghcr.io/perseus-computing-llc/perseus-vault:2.13.0",
     "transport": {"type": "stdio"},
     "runtimeHint": "docker",
     "runtimeArguments": [

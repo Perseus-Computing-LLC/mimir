@@ -4,8 +4,14 @@ name: Publish to MCP Registry
 # Runs after a GitHub Release, or on demand. Auth is GitHub OIDC (no token):
 # the workflow's identity proves ownership of the io.github.Perseus-Computing-LLC
 # namespace. Package ownership is proven by the OCI label on the GHCR image
-# (io.modelcontextprotocol.server.name in the Dockerfile), so publish after the
-# docker.yml image push for a release has completed.
+# (io.modelcontextprotocol.server.name in the Dockerfile).
+#
+# Robustness (added after the v2.13.0 publish failure):
+#   1. The version in server.json is synced from Cargo.toml at publish time,
+#      so a stale hand-maintained version can never be published again.
+#   2. The publish waits for the GHCR image tag to exist first — docker.yml
+#      (tag push) and this workflow (release published) race each other, and
+#      the registry validates that the OCI image exists.
 
 on:
   release:
@@ -21,6 +27,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Sync server.json version from Cargo.toml
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "Cargo.toml version: $VERSION"
+          jq --arg v "$VERSION" \
+             '.version = $v | .packages[0].identifier = "ghcr.io/perseus-computing-llc/perseus-vault:" + $v' \
+             server.json > server.json.tmp && mv server.json.tmp server.json
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          cat server.json
+
+      - name: Wait for GHCR image tag
+        run: |
+          # docker.yml pushes ghcr.io image on the v* tag; the registry publish
+          # validates the OCI image exists. Poll until it does (up to ~15 min).
+          REPO=perseus-computing-llc/perseus-vault
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO}:pull" | jq -r .token)
+          for i in $(seq 1 30); do
+            if curl -fsSL -o /dev/null \
+                 -H "Authorization: Bearer ${TOKEN}" \
+                 -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json" \
+                 "https://ghcr.io/v2/${REPO}/manifests/${VERSION}"; then
+              echo "Image ${REPO}:${VERSION} is available."
+              exit 0
+            fi
+            echo "Attempt ${i}/30: ${REPO}:${VERSION} not in GHCR yet, sleeping 30s..."
+            sleep 30
+          done
+          echo "::error::GHCR image ${REPO}:${VERSION} never appeared — check the Docker workflow for this tag."
+          exit 1
 
       - name: Install mcp-publisher
         run: |
