@@ -108,6 +108,26 @@ jobs:
       - name: Test (no default features)
         run: cargo test --no-default-features --verbose
 
+  # Guard the optional gRPC transport (#354): src/grpc.rs is entirely
+  # feature-gated and was previously absent from every CI lane, so the whole
+  # external wire surface shipped unverified. tonic-build invokes protoc at
+  # build time, so install protobuf-compiler first. Built without default
+  # features to isolate the grpc deps from the embedding stack and keep the
+  # job fast; `cargo test` also runs the in-module unit tests for the
+  # implemented RPCs and error sanitization.
+  grpc-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build (grpc, no embeddings)
+        run: cargo build --no-default-features --features grpc --verbose
+      - name: Test (grpc, no embeddings)
+        run: cargo test --no-default-features --features grpc --verbose
+
   # Guard the optional multimodal document-extraction feature (#236): it pulls
   # zip + pdf-extract, so make sure it still builds and its tests pass. Built
   # without default features to isolate the multimodal deps from the embedding

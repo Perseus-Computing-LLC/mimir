@@ -27,13 +27,33 @@ pub mod grpc {
         }
     }
 
-    // Helper to run DB operations inside the mutex
+    // Helper to run DB operations inside the mutex.
+    //
+    // Error hygiene (#354): this module is a documented external wire contract,
+    // so internal error text (rusqlite constraint/column names, file paths)
+    // must not reach remote clients. Match the HTTP surface (src/web/mod.rs,
+    // which returns a bare 500 with no detail): log the detail server-side,
+    // return a generic INTERNAL to the client. Handlers that raise a *typed*
+    // Status inside the closure (e.g. get_entity's not_found) get it passed
+    // through unchanged instead of being flattened into INTERNAL.
     fn with_db<T>(
         server: &MnemeGrpcServer,
         f: impl FnOnce(&Database) -> Result<T, Box<dyn std::error::Error>>,
     ) -> Result<T, Status> {
         let db = server.db.lock().map_err(|_| Status::internal("lock poisoned"))?;
-        f(&db).map_err(|e| Status::internal(e.to_string()))
+        f(&db).map_err(sanitize_error)
+    }
+
+    /// Map a handler error to the client-facing Status: intentional `Status`
+    /// values pass through; everything else is logged and genericized.
+    fn sanitize_error(e: Box<dyn std::error::Error>) -> Status {
+        match e.downcast::<Status>() {
+            Ok(status) => *status,
+            Err(e) => {
+                eprintln!("mimir grpc: internal error: {e}");
+                Status::internal("internal error")
+            }
+        }
     }
 
     #[tonic::async_trait]
@@ -279,6 +299,156 @@ pub mod grpc {
             .await?;
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::mneme_server::Mneme;
+        use super::*;
+        use crate::db::Database;
+
+        fn test_server() -> (MnemeGrpcServer, String) {
+            let path = std::env::temp_dir()
+                .join(format!("mimir-test-grpc-{}.db", uuid::Uuid::new_v4()));
+            let path_str = path.to_str().unwrap().to_string();
+            let db = Database::open(&path_str).expect("open test db");
+            (MnemeGrpcServer::new(Arc::new(Mutex::new(db))), path_str)
+        }
+
+        fn remember_req(key: &str) -> RememberRequest {
+            RememberRequest {
+                category: "note".to_string(),
+                key: key.to_string(),
+                body_json: "{\"content\":\"hello grpc\"}".to_string(),
+                status: "active".to_string(),
+                r#type: "insight".to_string(),
+                tags: vec!["t1".to_string()],
+                importance: 1.0,
+                topic_path: String::new(),
+                recall_when: vec![],
+                always_on: false,
+                certainty: 0.5,
+                workspace_hash: String::new(),
+                agent_id: String::new(),
+                visibility: "workspace".to_string(),
+            }
+        }
+
+        #[test]
+        fn sanitize_error_hides_internal_detail_from_clients() {
+            // #354: raw internal error text (constraint/column names) must not
+            // reach gRPC clients — generic message out, detail logged only.
+            let e: Box<dyn std::error::Error> =
+                "UNIQUE constraint failed: entities.category, entities.key".into();
+            let status = sanitize_error(e);
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert_eq!(status.message(), "internal error");
+        }
+
+        #[test]
+        fn sanitize_error_passes_through_typed_statuses() {
+            let e: Box<dyn std::error::Error> = Box::new(Status::not_found("entity not found"));
+            let status = sanitize_error(e);
+            assert_eq!(status.code(), tonic::Code::NotFound);
+            assert_eq!(status.message(), "entity not found");
+        }
+
+        #[test]
+        fn entity_to_proto_maps_fields() {
+            let e = models::Entity {
+                id: "ent-1".to_string(),
+                category: "note".to_string(),
+                key: "k".to_string(),
+                body_json: "{}".to_string(),
+                status: "active".to_string(),
+                entity_type: "insight".to_string(),
+                tags: vec!["a".to_string()],
+                decay_score: 0.7,
+                retrieval_count: 3,
+                layer: "working".to_string(),
+                topic_path: "x/y".to_string(),
+                archived: false,
+                archive_reason: String::new(),
+                links: vec![],
+                verified: true,
+                source: "grpc".to_string(),
+                always_on: true,
+                certainty: 0.9,
+                workspace_hash: "ws".to_string(),
+                agent_id: "agent".to_string(),
+                visibility: "workspace".to_string(),
+                created_at_unix_ms: 1,
+                last_accessed_unix_ms: 2,
+                embedding: None,
+            };
+            let p = entity_to_proto(&e);
+            assert_eq!(p.id, "ent-1");
+            assert_eq!(p.category, "note");
+            assert_eq!(p.key, "k");
+            assert_eq!(p.r#type, "insight");
+            assert_eq!(p.tags, vec!["a".to_string()]);
+            assert_eq!(p.decay_score, 0.7);
+            assert_eq!(p.retrieval_count, 3);
+            assert!(p.verified);
+            assert!(p.always_on);
+            assert_eq!(p.workspace_hash, "ws");
+            assert_eq!(p.created_at_unix_ms, 1);
+            assert_eq!(p.last_accessed_unix_ms, 2);
+        }
+
+        #[tokio::test]
+        async fn remember_then_get_entity_roundtrip() {
+            let (server, path) = test_server();
+            let resp = server
+                .remember(Request::new(remember_req("k1")))
+                .await
+                .expect("remember");
+            let r = resp.into_inner();
+            assert!(!r.id.is_empty());
+            assert_eq!(r.category, "note");
+            assert_eq!(r.key, "k1");
+
+            let got = server
+                .get_entity(Request::new(GetEntityRequest { id: r.id.clone() }))
+                .await
+                .expect("get_entity")
+                .into_inner();
+            assert_eq!(got.id, r.id);
+            assert_eq!(got.category, "note");
+            assert_eq!(got.key, "k1");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn get_entity_missing_returns_not_found_not_internal() {
+            // The typed not_found raised inside the with_db closure must
+            // survive sanitize_error instead of being flattened to INTERNAL.
+            let (server, path) = test_server();
+            let err = server
+                .get_entity(Request::new(GetEntityRequest { id: "does-not-exist".to_string() }))
+                .await
+                .expect_err("missing entity should error");
+            assert_eq!(err.code(), tonic::Code::NotFound);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn health_and_stats_respond() {
+            let (server, path) = test_server();
+            let h = server
+                .health(Request::new(HealthRequest {}))
+                .await
+                .expect("health")
+                .into_inner();
+            assert!(h.healthy);
+            let s = server
+                .stats(Request::new(StatsRequest {}))
+                .await
+                .expect("stats")
+                .into_inner();
+            assert_eq!(s.total_entities, 0);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 // Non-grpc fallback
@@ -296,5 +466,26 @@ pub mod grpc {
         _addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
         Err("gRPC transport not compiled in. Rebuild with: cargo build --features grpc".into())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn stub_serve_returns_actionable_error() {
+            let path = std::env::temp_dir()
+                .join(format!("mimir-test-grpc-stub-{}.db", uuid::Uuid::new_v4()));
+            let path_str = path.to_str().unwrap().to_string();
+            let db = Database::open(&path_str).expect("open test db");
+            let err = serve(
+                Arc::new(Mutex::new(db)),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .await
+            .expect_err("stub must refuse to serve");
+            assert!(err.to_string().contains("--features grpc"));
+            let _ = std::fs::remove_file(&path_str);
+        }
     }
 }
