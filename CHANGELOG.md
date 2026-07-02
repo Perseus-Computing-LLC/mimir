@@ -56,6 +56,70 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   (20 hits) recall 5.1ms → 0.08ms (~64x); dense-match queries pay a small
   fixed probe cost (common term ~33k hits: +~0.5ms, the intrinsic FTS5
   prefix-doclist materialization — they were and remain O(corpus)).
+- Web dashboard and gRPC no longer wrap the pooled `Database` in a global
+  `std::Mutex` (#402): both surfaces now share the SAME `Arc<Database>` as the
+  MCP transport (one process, one connection pool — the dashboard previously
+  opened a second 16-conn pool on the same file) and run every DB call on the
+  blocking thread pool via `tokio::task::spawn_blocking`, mirroring
+  transport.rs (#210/#217). Dashboard requests and gRPC RPCs now execute in
+  parallel instead of single-lane, and no longer stall async runtime workers.
+- `GET /api/graph` is paginated (#402): `limit` (default 500, max 5000) and
+  `offset` query params; response adds `total_nodes` / `returned_nodes` /
+  `truncated` so clients can tell a page from the whole graph (previously it
+  full-scanned and returned every node+edge unpaginated — tens of MB of JSON
+  at 100k entities, per dashboard render). The dashboard's graph tab shows a
+  truncation note when capped. Edges dangling outside the returned node set
+  are dropped (previously the unscoped path emitted edges to archived/deleted
+  targets that the renderer couldn't resolve).
+- `mimir_cohere` no longer holds one writer lock for the whole grooming pass
+  (#400). The single BEGIN IMMEDIATE previously spanned promotion, a
+  full-table decay UPDATE, link building, and archive — a lock window linear
+  in store size (~4.4s @100k entities) that crossed the default 5000ms
+  `busy_timeout` just past ~130k entities, so concurrent `remember`s failed
+  SQLITE_BUSY during every maintenance run. cohere now runs three bounded
+  windows: promotion, a decay pass chunked at 1000 rows per drop-safe
+  transaction (with a 2ms inter-chunk yield so waiting writers can actually
+  acquire the lock), and link+archive. Longest single hold measured @200k
+  entities (release, ~450B rows): 0.68s → 0.09s; the write work under any
+  one lock is now bounded by the chunk size, and the remaining linear
+  component (the promote/archive full-table read scans) is ~7.5x shallower
+  than before. Preserves the #399/#405 no-op write skip (floored
+  rows are not rewritten), cohere's documented ×0.95 standalone decay
+  semantics, and per-transaction drop-safety (#388); the run stays correct
+  under interleaved writers, and the new non-atomicity boundaries are
+  documented at the split site.
+- `mimir_autocohere`'s cohere step actually creates auto-links now (#412).
+  `CohereParams`' derived `Default` gave `max_links = 0`, and autocohere
+  builds its params with `..Default::default()` — so the link-candidate
+  query ran with `LIMIT 0` and the graph-building half of scheduled
+  maintenance had silently been a no-op since it shipped. A manual
+  `Default` impl now carries the same `max_links = 20` budget the
+  `mimir_cohere` argument path gets from its serde default;
+  `promote_threshold`/`archive_threshold` keep their fall-through-to-
+  constants sentinels, and explicit `mimir_cohere` args are unaffected.
+- `GET /api/entities`, `GET /api/search`, and `GET /api/journal` clamp
+  `limit` to [1, 5000] (#413), exactly like #402's `/api/graph` clamp: an
+  explicit `?limit=1000000` previously passed straight into SQL and dumped
+  the whole table (14.7MB/1.5s at 20k rows) — and since #402 moved the
+  dashboard onto the shared connection pool, a handful of such requests
+  could pin every pooled connection and brown out MCP traffic. Defaults are
+  unchanged (50 each); non-numeric/overflowing `limit`/`offset` values are
+  rejected with 400; the responses now echo the effective `limit` (and
+  `offset` for `/api/entities`).
+
+### Changed
+- **Empty-string `workspace_hash` is now STRICT everywhere (#408).**
+  `list_entities`/`count_entities` (the dashboard entity list and
+  its `total`) and `get_entity_graph` treated `Some("")` as *unscoped* —
+  no filter, every workspace's rows — while `recall`/`recall_when`/`follow`
+  treat `""` with strict equality (only the global `''` rows). The same
+  argument value meant two different scopes depending on the surface. All
+  three now apply strict equality for any `Some`, including `Some("")`;
+  `None`/omitting the param remains the unscoped view. On the web API this
+  means `?workspace=` (present but empty) now returns only global-`''`
+  rows instead of everything — omit the parameter entirely for the
+  unscoped view. The bundled dashboard never sends the parameter, so its
+  behavior is unchanged.
 
 ## [2.14.0] - 2026-07-02
 
