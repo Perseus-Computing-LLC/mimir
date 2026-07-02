@@ -1859,6 +1859,30 @@ impl Database {
                 Self::snapshot_live_row_to_history(&tx, &history_id, now, &id)?;
             }
 
+            // #382: remember must not clobber the stored link graph. Callers
+            // construct the Entity without its stored links (the MCP remember
+            // tool always passes []), so a wholesale `links = caller` erased
+            // every edge on each re-assert — and even a caller that read
+            // first could lose a concurrently added edge. Union stored ∪
+            // caller under the writer lock; unlink is the only removal path.
+            let links_json = {
+                let stored: String = tx
+                    .query_row(
+                        "SELECT links FROM entities WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| "[]".to_string());
+                let mut merged: Vec<MemoryLink> =
+                    serde_json::from_str(&stored).unwrap_or_default();
+                for l in &entity.links {
+                    if !merged.iter().any(|m| m.target_id == l.target_id) {
+                        merged.push(l.clone());
+                    }
+                }
+                serde_json::to_string(&merged)?
+            };
+
             tx.execute(
                 "UPDATE entities SET
                     body_json = ?1, status = ?2, type = ?3, tags = ?4,
@@ -2815,7 +2839,8 @@ impl Database {
         relationship: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn()?;
-        // Verify both entities exist
+        // Verify both entities exist (id resolution only — ids are immutable,
+        // so these reads don't need the writer lock).
         let from = self
             .get_entity(from_category, from_key)?
             .ok_or("Source entity not found")?;
@@ -2827,8 +2852,13 @@ impl Database {
             )
             .map_err(|_| "Target entity not found")?;
 
+        // #382: the links read-modify-write must hold the writer lock — two
+        // concurrent link() calls reading the same base array on the bare
+        // pooled connection would both write back, silently dropping the
+        // first edge. See audited_write_tx (#380).
+        let tx = Self::audited_write_tx(&conn)?;
         // Get existing links (default to empty array if missing)
-        let links_str: String = conn
+        let links_str: String = tx
             .query_row(
                 "SELECT links FROM entities WHERE id = ?1",
                 params![from.id],
@@ -2846,10 +2876,11 @@ impl Database {
             });
         }
         let new_links = serde_json::to_string(&links)?;
-        conn.execute(
+        tx.execute(
             "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
             params![new_links, now_ms(), from.id],
         )?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -2866,7 +2897,11 @@ impl Database {
             .get_entity(from_category, from_key)?
             .ok_or("Source entity not found")?;
 
-        let links_str: String = conn.query_row(
+        // #382: same writer-lock discipline as link() — an unlink racing a
+        // link on the same entity must not clobber the other's edit. The
+        // no-op early return drops the tx (rollback): nothing written.
+        let tx = Self::audited_write_tx(&conn)?;
+        let links_str: String = tx.query_row(
             "SELECT links FROM entities WHERE id = ?1",
             params![from.id],
             |r| r.get(0),
@@ -2881,10 +2916,11 @@ impl Database {
         }
 
         let new_links = serde_json::to_string(&links)?;
-        conn.execute(
+        tx.execute(
             "UPDATE entities SET links = ?1, last_accessed_unix_ms = ?2 WHERE id = ?3",
             params![new_links, now_ms(), from.id],
         )?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -7904,6 +7940,151 @@ mod tests {
         assert!(
             back.is_some(),
             "same-millisecond invalidated version must stay reachable via as_of"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_reassert_preserves_stored_links() {
+        // #382 (deterministic half): callers construct the Entity without its
+        // stored links — the MCP remember tool always passes [] — so the
+        // wholesale `links = caller` UPDATE erased every edge on each
+        // re-assert: remember → link → remember lost the link even
+        // single-threaded.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-382a", "facts", "src382a", r#"{"n":"v1"}"#))
+            .unwrap();
+        db.remember(&make_entity("e-382t", "facts", "tgt382", r#"{"n":"t"}"#))
+            .unwrap();
+        db.link("facts", "src382a", "e-382t", "related").unwrap();
+
+        // Identical-body re-assert (the common MCP path) …
+        db.remember(&make_entity("ignored", "facts", "src382a", r#"{"n":"v1"}"#))
+            .unwrap();
+        let e = db.get_entity("facts", "src382a").unwrap().unwrap();
+        assert_eq!(
+            e.links.len(),
+            1,
+            "identical re-assert must not erase stored links"
+        );
+
+        // … and a content-changing one.
+        db.remember(&make_entity("ignored", "facts", "src382a", r#"{"n":"v2"}"#))
+            .unwrap();
+        let e = db.get_entity("facts", "src382a").unwrap().unwrap();
+        assert_eq!(
+            e.links.len(),
+            1,
+            "content-changing re-assert must not erase stored links"
+        );
+        assert_eq!(e.links[0].target_id, "e-382t");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remember_unions_caller_links_with_stored() {
+        // #382 semantics decision: remember merges caller links with stored
+        // links (dedup by target_id); unlink is the only removal path.
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-382b", "facts", "src382b", r#"{"n":"v1"}"#))
+            .unwrap();
+        db.remember_skip_dedup(&make_entity("e-382u", "facts", "tgtu", r#"{"n":"t"}"#))
+            .unwrap();
+        db.remember_skip_dedup(&make_entity("e-382v", "facts", "tgtv", r#"{"n":"t"}"#))
+            .unwrap();
+        db.link("facts", "src382b", "e-382u", "related").unwrap();
+
+        let mut e = make_entity("ignored", "facts", "src382b", r#"{"n":"v2"}"#);
+        e.links.push(MemoryLink {
+            target_id: "e-382v".to_string(),
+            relationship: "caused-by".to_string(),
+            weight: 0.9,
+        });
+        db.remember(&e).unwrap();
+
+        let live = db.get_entity("facts", "src382b").unwrap().unwrap();
+        let targets: Vec<&str> = live.links.iter().map(|l| l.target_id.as_str()).collect();
+        assert!(
+            targets.contains(&"e-382u") && targets.contains(&"e-382v"),
+            "remember must union caller links with stored links, got {targets:?}"
+        );
+        assert_eq!(live.links.len(), 2, "no duplicate edges");
+
+        // unlink still removes.
+        db.unlink("facts", "src382b", "e-382u").unwrap();
+        let live = db.get_entity("facts", "src382b").unwrap().unwrap();
+        assert_eq!(live.links.len(), 1);
+        assert_eq!(live.links[0].target_id, "e-382v");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_links_and_remembers_do_not_lose_edges() {
+        // #382 (concurrent half): link()'s read-modify-write on the links
+        // JSON ran on the bare pooled connection — two concurrent link()
+        // calls could read the same base array and the second write dropped
+        // the first edge; remember's full-row UPDATE clobbered edges added
+        // after the caller's read. Hammer one source entity with parallel
+        // link() calls AND content-changing re-asserts; every edge must
+        // survive.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (db, path) = temp_db();
+        db.remember(&make_entity("e-382c", "facts", "src382c", r#"{"n":"v0"}"#))
+            .unwrap();
+        const TARGETS: usize = 12;
+        for i in 0..TARGETS {
+            // skip_dedup: the identical tiny bodies would otherwise
+            // near-dup-merge into one row and the links would have no target.
+            db.remember_skip_dedup(&make_entity(
+                &format!("t-382-{i}"),
+                "facts",
+                &format!("tgt382c-{i}"),
+                r#"{"n":"t"}"#,
+            ))
+            .unwrap();
+        }
+
+        let db = Arc::new(db);
+        let mut handles = Vec::new();
+        // Parallel linkers, one distinct target each.
+        for i in 0..TARGETS {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                db.link("facts", "src382c", &format!("t-382-{i}"), "related")
+                    .expect("link");
+            }));
+        }
+        // A re-assert writer racing them (the remember clobber path).
+        {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for i in 0..10 {
+                    let e = make_entity(
+                        "ignored",
+                        "facts",
+                        "src382c",
+                        &format!(r#"{{"n":"v{}"}}"#, i + 1),
+                    );
+                    db.remember(&e).expect("re-assert");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let live = db.get_entity("facts", "src382c").unwrap().unwrap();
+        assert_eq!(
+            live.links.len(),
+            TARGETS,
+            "edges lost under concurrency: expected {TARGETS}, got {} ({:?})",
+            live.links.len(),
+            live.links
+                .iter()
+                .map(|l| l.target_id.as_str())
+                .collect::<Vec<_>>()
         );
         let _ = fs::remove_file(&path);
     }
