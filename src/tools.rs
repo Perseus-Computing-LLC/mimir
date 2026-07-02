@@ -1599,6 +1599,11 @@ pub struct FollowArgs {
     #[serde(default)]
     #[allow(dead_code)]
     pub context: Option<String>,
+    /// #396 (the #338 pattern): when set, the target row is resolved with
+    /// strict workspace equality — matching workspace-scoped recall — instead
+    /// of the deterministic global-first pick.
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
 }
 
 /// Record whether an entity (convention/insight/lesson) was actually FOLLOWED
@@ -1610,7 +1615,7 @@ pub fn handle_follow(db: &Database, args: Value) -> Result<String, String> {
         serde_json::from_value(args).map_err(|e| format!("Invalid follow arguments: {}", e))?;
 
     let report = db
-        .follow(&a.category, &a.key, a.followed)
+        .follow(&a.category, &a.key, a.followed, a.workspace_hash.as_deref())
         .map_err(|e| format!("Follow failed: {}", e))?;
 
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
@@ -4223,6 +4228,20 @@ mod tests {
         let v = json!({ "query": "test", "limit": null });
         let a: RecallArgs = serde_json::from_value(v).unwrap();
         assert_eq!(a.limit, 10);
+    }
+
+    #[test]
+    fn follow_args_accept_null_workspace_hash() {
+        // #396's new optional arg must follow the explicit-null tolerance
+        // rule (#330) like the rest of the tool surface.
+        let v = json!({
+            "category": "convention",
+            "key": "k",
+            "followed": true,
+            "workspace_hash": null
+        });
+        let a: FollowArgs = serde_json::from_value(v).expect("null workspace_hash must deserialize");
+        assert!(a.workspace_hash.is_none());
     }
 
     #[test]

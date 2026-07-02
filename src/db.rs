@@ -4440,11 +4440,19 @@ impl Database {
     /// actually changed behavior. Feeds into decay_tick's composite scoring
     /// and flips efficacy_status to 'useful' or 'dead' once enough attempts
     /// accrue, so dead rules decay out of recall and useful ones resist decay.
+    ///
+    /// `workspace_hash` (#396, the #338 pattern): when set, the row is
+    /// resolved with STRICT workspace equality — the same semantics as a
+    /// workspace-scoped recall — so an agent stamps efficacy onto the row it
+    /// actually saw, never the global `''` row or another workspace's row.
+    /// When absent, the deterministic pick (#391: global `''` first, then
+    /// lexicographically-first workspace) is kept unchanged.
     pub fn follow(
         &self,
         category: &str,
         key: &str,
         followed: bool,
+        workspace_hash: Option<&str>,
     ) -> Result<crate::models::FollowReport, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         // #385: read-decide-write — the counts must be read under the writer
@@ -4458,17 +4466,36 @@ impl Database {
         // identity since #339 — the same key can exist per workspace — and the
         // old key-addressed UPDATE stamped one workspace's counts and
         // efficacy_status onto every workspace's row (and archived rows).
-        // Same deterministic pick as get_entity/resolve_entity_id, restricted
-        // to live rows.
-        let existing: Option<(String, i64, i64)> = tx
-            .query_row(
+        // Without a workspace: same deterministic pick as
+        // get_entity/resolve_entity_id, restricted to live rows. With one
+        // (#396): strict equality, no global fallback — a workspace-scoped
+        // recall never surfaced the `''` row, so falling back would stamp a
+        // row the agent never saw.
+        let row_result = match workspace_hash {
+            Some(ws) => tx.query_row(
+                "SELECT id, follow_count, miss_count FROM entities \
+                 WHERE category = ?1 AND key = ?2 AND workspace_hash = ?3 \
+                 AND archived = 0 \
+                 ORDER BY id ASC LIMIT 1",
+                params![category, key, ws],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ),
+            None => tx.query_row(
                 "SELECT id, follow_count, miss_count FROM entities \
                  WHERE category = ?1 AND key = ?2 AND archived = 0 \
                  ORDER BY workspace_hash ASC, id ASC LIMIT 1",
                 params![category, key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .ok();
+            ),
+        };
+        // #394: only "no rows" maps to the not-found report — a real rusqlite
+        // error (locked DB, corruption) must propagate, not masquerade as
+        // "not found".
+        let existing: Option<(String, i64, i64)> = match row_result {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(Box::new(e)),
+        };
 
         let (target_id, follow_count, miss_count) = match existing {
             Some((id, f, m)) => {
@@ -13364,20 +13391,20 @@ mod tests {
 
         // Below the 5-attempt floor: status stays 'unverified' even at 100%.
         for _ in 0..3 {
-            let r = db.follow("convention", "test-rule", true).unwrap();
+            let r = db.follow("convention", "test-rule", true, None).unwrap();
             assert_eq!(r.efficacy_status, "unverified");
         }
 
         // 4th followed, 5th missed -> 4/5 = 0.8 >= USEFUL_THRESHOLD (0.75).
-        let r4 = db.follow("convention", "test-rule", true).unwrap();
+        let r4 = db.follow("convention", "test-rule", true, None).unwrap();
         assert_eq!(r4.follow_count, 4);
-        let r5 = db.follow("convention", "test-rule", false).unwrap();
+        let r5 = db.follow("convention", "test-rule", false, None).unwrap();
         assert_eq!(r5.miss_count, 1);
         assert!((r5.follow_rate - 0.8).abs() < 1e-9, "got {}", r5.follow_rate);
         assert_eq!(r5.efficacy_status, "useful");
 
         // Unknown entity -> found: false, no panic.
-        let missing = db.follow("convention", "does-not-exist", true).unwrap();
+        let missing = db.follow("convention", "does-not-exist", true, None).unwrap();
         assert!(!missing.found);
 
         let _ = fs::remove_file(&path);
@@ -13409,7 +13436,7 @@ mod tests {
                 let db = Arc::clone(&db);
                 thread::spawn(move || {
                     for _ in 0..CALLS {
-                        db.follow("convention", "hot-rule", true).expect("follow");
+                        db.follow("convention", "hot-rule", true, None).expect("follow");
                     }
                 })
             })
@@ -13450,7 +13477,7 @@ mod tests {
         b.workspace_hash = "bbbb".to_string();
         db.remember_skip_dedup(&b).unwrap();
 
-        let r = db.follow("convention", "shared-rule", true).unwrap();
+        let r = db.follow("convention", "shared-rule", true, None).unwrap();
         assert!(r.found);
         assert_eq!(r.follow_count, 1);
 
@@ -13473,6 +13500,111 @@ mod tests {
             (0, 0),
             "the other workspace's row of the same key must be untouched"
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn follow_with_workspace_stamps_only_the_matching_workspace_row() {
+        // #396: a workspace-scoped agent recalls with strict equality
+        // (workspace_hash = ?) and never sees the global '' row, so its
+        // follow() must land on ITS row — not the deterministic global-first
+        // pick, which would give another row phantom counts while the row the
+        // agent actually saw accrues no signal.
+        let (db, path) = temp_db();
+        let g = make_entity("f-396-g", "convention", "ws-rule", r#"{"rule":"global"}"#);
+        db.remember_skip_dedup(&g).unwrap(); // workspace_hash = '' (global)
+        let mut a = make_entity("f-396-a", "convention", "ws-rule", r#"{"rule":"a"}"#);
+        a.workspace_hash = "aaaa".to_string();
+        db.remember_skip_dedup(&a).unwrap();
+        let mut b = make_entity("f-396-b", "convention", "ws-rule", r#"{"rule":"b"}"#);
+        b.workspace_hash = "bbbb".to_string();
+        db.remember_skip_dedup(&b).unwrap();
+
+        let r = db.follow("convention", "ws-rule", true, Some("bbbb")).unwrap();
+        assert!(r.found, "the bbbb row exists and must be found");
+        assert_eq!(r.follow_count, 1);
+
+        let conn = db.conn().unwrap();
+        let count_of = |id: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT follow_count, miss_count FROM entities WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count_of("f-396-b"),
+            (1, 0),
+            "the workspace-matching row takes the follow"
+        );
+        assert_eq!(
+            count_of("f-396-g"),
+            (0, 0),
+            "the global '' row must NOT take a workspace-scoped follow"
+        );
+        assert_eq!(
+            count_of("f-396-a"),
+            (0, 0),
+            "another workspace's row must be untouched"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn follow_without_workspace_keeps_deterministic_pick() {
+        // #396 back-compat pin: with no workspace_hash the resolution is
+        // unchanged — global '' row first, then lexicographically-first
+        // workspace (the #391 get_entity pick).
+        let (db, path) = temp_db();
+        let g = make_entity("f-396-d0", "convention", "det-rule", r#"{"rule":"global"}"#);
+        db.remember_skip_dedup(&g).unwrap(); // workspace_hash = '' (global)
+        let mut a = make_entity("f-396-d1", "convention", "det-rule", r#"{"rule":"a"}"#);
+        a.workspace_hash = "aaaa".to_string();
+        db.remember_skip_dedup(&a).unwrap();
+
+        let r = db.follow("convention", "det-rule", true, None).unwrap();
+        assert!(r.found);
+
+        let conn = db.conn().unwrap();
+        let count_of = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT follow_count FROM entities WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count_of("f-396-d0"), 1, "global '' row is the unscoped pick");
+        assert_eq!(count_of("f-396-d1"), 0, "workspace row untouched by unscoped follow");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn follow_with_unknown_workspace_is_clean_not_found() {
+        // #396: workspace given but no row in that workspace — clean
+        // found:false, no global fallback, nothing stamped anywhere.
+        let (db, path) = temp_db();
+        let g = make_entity("f-396-n0", "convention", "nf-rule", r#"{"rule":"global"}"#);
+        db.remember_skip_dedup(&g).unwrap(); // workspace_hash = '' (global)
+        let mut a = make_entity("f-396-n1", "convention", "nf-rule", r#"{"rule":"a"}"#);
+        a.workspace_hash = "aaaa".to_string();
+        db.remember_skip_dedup(&a).unwrap();
+
+        let r = db.follow("convention", "nf-rule", true, Some("zzzz")).unwrap();
+        assert!(!r.found, "no row in workspace zzzz — must be not-found");
+        assert_eq!(r.follow_count, 0);
+
+        let conn = db.conn().unwrap();
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(follow_count + miss_count), 0) FROM entities \
+                 WHERE category = 'convention' AND key = 'nf-rule'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 0, "nothing may be stamped on any row");
         let _ = fs::remove_file(&path);
     }
 
@@ -13517,11 +13649,11 @@ mod tests {
 
         // 1 followed, 4 missed -> 1/5 = 0.2, right at DEAD_THRESHOLD (not below),
         // so push one more miss to go clearly under it.
-        db.follow("convention", "ignored-rule", true).unwrap();
+        db.follow("convention", "ignored-rule", true, None).unwrap();
         for _ in 0..5 {
-            db.follow("convention", "ignored-rule", false).unwrap();
+            db.follow("convention", "ignored-rule", false, None).unwrap();
         }
-        let r = db.follow("convention", "ignored-rule", false).unwrap();
+        let r = db.follow("convention", "ignored-rule", false, None).unwrap();
         assert!(r.follow_rate < 0.20, "got {}", r.follow_rate);
         assert_eq!(r.efficacy_status, "dead");
 

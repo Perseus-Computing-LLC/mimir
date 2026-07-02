@@ -3,6 +3,23 @@
 All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `mimir_follow` accepts an optional `workspace_hash` (#396, the #338
+  pattern): when set, the efficacy stamp resolves its target row with strict
+  workspace equality — the same semantics as a workspace-scoped recall — so a
+  workspace-scoped agent's follow/miss signal lands on the row it actually
+  saw, instead of the deterministic global-first pick giving another
+  workspace's row (or the global `''` row) phantom counts. Omitted = the
+  existing deterministic pick, unchanged.
+
+### Fixed
+- `follow()`'s row resolution no longer collapses real DB errors into
+  "not found" (#396, the #394 principle): only `QueryReturnedNoRows` maps to
+  the clean `found: false` report; a locked file or corruption error now
+  propagates.
+
 ## [2.14.0] - 2026-07-02
 
 ### Added

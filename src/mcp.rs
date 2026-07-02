@@ -2125,6 +2125,10 @@ fn list_tools(id: Option<Value>) -> JsonRpcResponse {
         "context": {
           "type": "string",
           "description": "Optional description of the action/context this observation relates to"
+        },
+        "workspace_hash": {
+          "type": "string",
+          "description": "Workspace scope filter. When set, the stamped row is resolved with strict workspace equality — the same semantics as a workspace-scoped recall — so the signal lands on the row the agent actually saw (no global fallback). Omit to keep the unscoped deterministic pick (global '' row first, then lexicographically-first workspace)."
         }
       },
       "required": [
